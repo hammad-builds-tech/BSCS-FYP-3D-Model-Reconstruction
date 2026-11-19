@@ -27,5 +27,31 @@ if [ -z "${FYP_PY:-}" ]; then
     done
     unset _fyp_cand
     FYP_PY="${FYP_PY:-$(command -v python3)}"
+
+    # Say which interpreter won when it is NOT the project venv. The silent
+    # fallback used to be the confusing failure here: with no venv the
+    # scripts quietly ran on the legacy conda env or the system python, which
+    # carry a different torch (or none), and the backend then failed much
+    # later with an unrelated-looking error.
+    case "$FYP_PY" in
+        "$FYP_ROOT/venv/bin/python") : ;;
+        *)
+            echo "WARNING: $FYP_ROOT/venv not found; using $FYP_PY" >&2
+            echo "         Expect a different torch/OpenCV than the tested" >&2
+            echo "         environment. See docs/BACKEND_SETUP.md." >&2
+            ;;
+    esac
 fi
 export FYP_PY
+
+# ROS 2 python packages (rclpy, cv_bridge) are built against the SYSTEM
+# python, numpy and OpenCV. An active conda environment puts its own python
+# first on PATH, which makes `import rclpy` fail with a misleading
+# "No module named 'em'". Warn once rather than let it look like a ROS
+# installation problem.
+if [ -n "${CONDA_PREFIX:-}" ]; then
+    echo "WARNING: conda env active (${CONDA_DEFAULT_ENV:-$CONDA_PREFIX})." >&2
+    echo "         ROS 2 python may fail with \"No module named 'em'\"." >&2
+    echo "         Run 'conda deactivate' in ROS terminals, or" >&2
+    echo "         'conda config --set auto_activate_base false'." >&2
+fi

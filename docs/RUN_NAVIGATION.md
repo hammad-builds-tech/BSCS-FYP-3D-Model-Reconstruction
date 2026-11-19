@@ -54,6 +54,12 @@ archived capture_fresh test when the pipeline stages are already cached.
 Evidence per run: `<DS>/evidence/` (overlays on recorded RGB, detour_metrics.json,
 VERDICT logs), `<DS>/trajectory_odom.log`, `<DS>/run.log`.
 
-Phase 2 (not yet enabled by design): live WebSocket depth + reactive obstacle
-layer + real-time replanning. Offline/map-based avoidance is the frozen,
-proven behaviour.
+Phase 2 (live WebSocket depth + reactive obstacle layer + real-time
+replanning) is **implemented and verified in simulation**: with
+`FYP_REACTIVE_OBSTACLES=1` the robot detects an obstacle that is not in the
+static map, replans around it and still reaches the goal within 0.15 m
+(5/5 runs; 0.127 m mean, 0.67 m clearance). See
+[`PHASE2_REACTIVE_OBSTACLES.md`](PHASE2_REACTIVE_OBSTACLES.md) and
+[`evidence/phase2/`](evidence/phase2/README.md). With the flag unset the
+offline/map-based avoidance described above is unchanged and remains the
+frozen, proven behaviour.

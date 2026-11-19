@@ -448,7 +448,16 @@ class DepthToScan(Node):
             scan.scan_time = 0.0
             scan.range_min = self.min_range
             scan.range_max = self.clearing_max_range
-            scan.ranges = ranges.tolist()
+            # ranges_from_relative_depth returns one value per image column,
+            # ordered left -> right of the image. A LaserScan is ordered from
+            # angle_min to angle_max, i.e. counter-clockwise in REP 103 (x
+            # forward, y left), so index 0 is the *rightmost* bearing and the
+            # last index is the leftmost. The image's left column therefore
+            # belongs at the end of the array, not the start: publishing the
+            # column order directly mirrors the scan left/right. The metric
+            # path bins by bearing and is unaffected (see
+            # levelled_scan_from_depth).
+            scan.ranges = ranges[::-1].tolist()
             self.pub.publish(scan)
 
         except (ValueError, TypeError) as exc:

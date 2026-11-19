@@ -120,10 +120,26 @@ Never claim a component works without evidence.
 
 ## 6. Hardware Constraints
 
-Development machine:
+This project is developed on more than one machine. Do not assume
+either one; measure before relying on a performance figure.
+
+Machine A (Phase 0 / Phase 1 reference, docs/PHASE1_COMPLETION_REPORT.md):
 - HP Victus laptop
-- NVIDIA RTX 4050 6GB VRAM
-- Ubuntu environment
+- Intel Core i5-13420H, 14 GiB RAM
+- NVIDIA RTX 4050 Laptop GPU, 6 GB VRAM
+- MiDaS DPT-Hybrid-384: ~40-45 ms/frame (~22-25 fps), FP16 ~1.7x faster
+
+Machine B (second verified platform, measured 18 Nov 2026):
+- HP ZBook 15 G6
+- Intel Core i7-9850H, 22 GiB RAM
+- NVIDIA Quadro T2000, 4 GB VRAM (3716 MiB usable), compute sm_75
+- MiDaS DPT-Hybrid-384: ~177-188 ms/frame (~5.3-5.6 fps), peak 604 MiB
+- FP16 is ~4.7x SLOWER than FP32 here (TU117 lacks usable tensor cores).
+  Do not enable autocast/FP16 on this machine. BF16 is on par with FP32.
+
+Both run Ubuntu 26.04.1, ROS 2 Lyrical, Gazebo 10.5.0, system Python 3.14.4.
+VRAM is not the binding constraint on either machine (peak 604 MiB);
+inference latency is.
 
 Consider:
 - GPU memory limitations.
@@ -149,16 +165,23 @@ Do not recommend unnecessarily large models.
 
 Repositories:
 
-origin:
-https://github.com/VividVortex777/BSCS-FYP-3D-Model-Reconstruction.git
+Verify with `git remote -v` before pushing; this section has been wrong
+before. As configured on the current clone (checked 18 Nov 2026) there is
+only ONE remote:
 
-upstream:
-https://github.com/hammad-builds-tech/fyp-smartphone-robot-navigation.git
+origin:
+https://github.com/hammad-builds-tech/BSCS-FYP-3D-Model-Reconstruction
+
+This is our own fork. The repository it was forked from is
+VividVortex777/BSCS-FYP-3D-Model-Reconstruction, which is NOT currently
+configured as a remote. If an `upstream` remote is added later, point it
+at that fork parent.
 
 Rules:
 
-- origin is our primary development repository.
-- upstream is the original friend's repository.
+- origin is our primary development repository (our fork).
+- The fork parent (VividVortex777/...) is the original friend's repository.
+- Never push to the fork parent without explicit permission.
 - Never push to upstream without explicit permission.
 - Never force-push.
 - Never rewrite existing Git history.

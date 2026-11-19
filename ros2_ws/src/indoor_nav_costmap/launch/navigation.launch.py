@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+from indoor_nav_costmap.params_overlay import build_params
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
@@ -18,11 +19,15 @@ from launch_ros.actions import Node
 def generate_launch_description():
     # Resolved from the installed package so the launch works from any clone
     # location (with --symlink-install this is the file in src/).
-    params_file = str(
+    committed_params = str(
         Path(get_package_share_directory("indoor_nav_costmap"))
         / "config"
         / "nav2_params.yaml"
     )
+    # Phase 2: with FYP_REACTIVE_OBSTACLES set this returns a patched copy
+    # that enables both costmaps' obstacle_layer from the live /scan. Without
+    # it the committed file is returned unchanged, so Phase 1 is unaffected.
+    params_file = build_params(committed_params)
 
     controller_params = [params_file]
     if os.environ.get("FYP_DEPTH_SOURCE", "phone") == "gazebo":

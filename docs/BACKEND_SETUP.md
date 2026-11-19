@@ -138,14 +138,46 @@ passes. It checks the following:
 
 It also reports timing and GPU memory.
 
-Approximate results on the RTX 4050 Laptop GPU, for a 640×480 image.
-These figures cover the model only (median of 10 runs, measured on
-2026-11-16):
+**These figures are per-GPU and do not transfer between machines.** Measure
+on your own hardware before quoting any of them; the two platforms below
+differ by about 4x.
+
+### NVIDIA RTX 4050 Laptop GPU (Phase 0/1 reference, 2026-11-16)
+
+640×480 image, model only, median of 10 runs:
 
 | Precision | Time per frame | Throughput | Peak GPU memory |
 |---|---|---|---|
 | FP32 | ~40–45 ms | ~22–25 fps | 604 MiB |
 | FP16 (autocast) | ~24–27 ms | ~37–42 fps | 868 MiB |
+
+In FP16 the depth differs from FP32 by at most 0.16% of the depth range.
+
+### NVIDIA Quadro T2000 (second verified platform, 2026-11-18)
+
+HP ZBook 15 G6, i7-9850H, 4 GB VRAM (3716 MiB usable), compute sm_75,
+driver 595.99.02. Same image size and method:
+
+| Precision | Time per frame | Throughput | Peak GPU memory |
+|---|---|---|---|
+| FP32 | ~177–188 ms | ~5.3–5.6 fps | 604 MiB |
+| FP16 (autocast) | **not usable — slower than FP32** | — | — |
+
+`scripts/smoke_test_midas_gpu.py` reports `RESULT: PASS` here and the
+backend's `predict()` matches a direct forward pass, so the model is
+correct — only about 4x slower.
+
+**Do not pass `--fp16` on this GPU.** A warmed 4096³ matmul measured
+FP32 70 ms versus FP16 327 ms, i.e. FP16 is ~4.7x *slower*; BF16 is on par
+with FP32 (74 ms). The Quadro T2000 is TU117-based and lacks the usable
+tensor cores the RTX 4050 has, so cuBLAS falls back to a slow FP16 path.
+`torch.cuda.get_device_properties(0).major >= 7` still reports `True`, so
+that check cannot be used to decide. `sm_75` *is* in the CUDA 13.2 build's
+arch list, so this is a performance characteristic, not a compatibility
+problem.
+
+Note that peak GPU memory is **604 MiB on both machines**: VRAM is not the
+constraint, inference latency is.
 
 Performance varies from run to run with the GPU clock speed, the GPU
 temperature (laptop GPUs slow down as they heat up) and whatever else
@@ -153,8 +185,8 @@ the system is doing. Treat these numbers as typical ranges, not exact
 benchmarks. Expect the full backend to be slower, because it also
 decodes and encodes JPEGs and moves data over the network.
 
-In FP16 the depth differs from FP32 by at most 0.16% of the depth range.
-The backend itself still runs in FP32.
+The backend itself always runs in FP32, so no code change is needed on
+either machine.
 
 ## 4. Run the backend and simulate the phone
 

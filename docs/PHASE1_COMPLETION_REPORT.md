@@ -52,6 +52,42 @@ this repository is written for **ROS 2 Lyrical** (scripts source
 environment above is the reference platform. Other distributions were not
 tested.
 
+### Second verified platform (added 18 November 2026)
+
+Phase 1 was later re-checked on a different machine. The build, the test
+suite and the acceptance run all reproduce; only the GPU figures differ.
+
+| Component | Machine A (above) | Machine B |
+|---|---|---|
+| Laptop | HP Victus | **HP ZBook 15 G6** |
+| CPU / RAM | i5-13420H, 14 GiB | **i7-9850H, 22 GiB** |
+| GPU | RTX 4050 Laptop, 6 GB | **Quadro T2000, 4 GB** (3716 MiB usable, sm_75) |
+| Driver | 595.99.02 | 595.99.02 |
+| OS / ROS 2 / Gazebo | 26.04.1 / Lyrical / 10.5.0 | identical |
+| System Python | 3.14.4 | 3.14.4 |
+| Nav2 | 1.5.2 | **1.5.1** |
+| `ros_gz_*` | 3.0.10 | **3.0.9** |
+| `tf2_ros` | 0.45.10 | **0.45.9** |
+
+Reproduced on Machine B:
+
+- `colcon build --symlink-install` 3/3; test suite at the same failure
+  baseline (style checks only).
+- Gazebo RGB-D camera at **15.18 Hz** (Machine A: 15.1 Hz).
+- MiDaS smoke test `RESULT: PASS`, peak GPU memory **604 MiB** — identical
+  to Machine A, so VRAM is not the constraint.
+- Acceptance run, goal (2.0, 0.0) from (0, −2): `SUCCEEDED`, ground-truth
+  final (1.9225, −0.0935), **0.121 m** from the goal — inside the 0.15 m
+  limit and within the 0.106–0.144 m band of section 11.
+
+**Not reproduced on Machine B:** the five-run repeatability study of
+section 11 (one run only), and the GPU performance figures. MiDaS runs
+**~177–188 ms/frame (~5.3–5.6 fps)** on Machine B against ~40–45 ms
+(~22–25 fps) on Machine A — about 4x slower — and **FP16 is ~4.7x slower
+than FP32** there, the opposite of Machine A. Every GPU timing in this
+report and in `docs/BACKEND_SETUP.md` is therefore specific to Machine A
+and must not be quoted as a property of the system.
+
 The ROS nodes run on the system Python; the backend runs in its own venv.
 They communicate only over HTTP. **Do not activate the backend venv in a ROS
 terminal**: `rclpy` and `cv_bridge` are built against the system numpy and

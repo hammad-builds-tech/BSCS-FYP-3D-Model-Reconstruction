@@ -147,3 +147,39 @@ def test_quaternion_roll_pitch():
     half = np.deg2rad(4.35) / 2.0
     roll, pitch = DepthToScan.roll_pitch_from_quaternion(0.0, np.sin(half), 0.0, np.cos(half))
     assert np.isclose(pitch, np.deg2rad(4.35)) and np.isclose(roll, 0.0)
+
+
+def test_relative_scan_is_not_mirrored_left_right():
+    """A near obstacle in the image's LEFT half must land at positive bearing.
+
+    ranges_from_relative_depth returns image-column order (left -> right).
+    A LaserScan runs angle_min -> angle_max, which is counter-clockwise in
+    REP 103, so the last index is the robot's left. depth_callback therefore
+    reverses the array before publishing. This test pins that orientation so
+    it matches levelled_scan_from_depth (see
+    test_rolled_camera_keeps_left_obstacle_on_the_left).
+    """
+    # Inverse MiDaS depth: larger value = closer. Put the close surface in
+    # the left half of the image only.
+    depth = np.full((40, 120), 10.0, dtype=np.float32)
+    depth[:, :60] = 250.0
+
+    column_order = DepthToScan.ranges_from_relative_depth(
+        depth,
+        vertical_roi_top=0.20,
+        vertical_roi_bottom=0.85,
+        target_beams=12,
+        min_range=0.15,
+        clearing_max_range=3.5,
+        inverse_depth=True,
+    )
+
+    # In image-column order the near surface is in the first half.
+    assert column_order[0] < column_order[-1]
+
+    # As published (reversed), the near surface must be at the END of the
+    # array, i.e. towards angle_max = the robot's left.
+    published = column_order[::-1]
+    assert published[-1] < published[0], "left obstacle must be at angle_max"
+    half = len(published) // 2
+    assert published[half:].min() < published[:half].min()
