@@ -33,7 +33,7 @@ restate the documents it points at.
 | [`TECHNICAL_ASSESSMENT.md`](TECHNICAL_ASSESSMENT.md) | Technical assessment |
 | [`PHASE3_COLLISION_MONITOR.md`](PHASE3_COLLISION_MONITOR.md) | Phase 3: Nav2 Collision Monitor integration, root cause and safety tests |
 | [`PHASE3_COMMAND_WATCHDOG.md`](PHASE3_COMMAND_WATCHDOG.md) | Phase 3: Gazebo command watchdog — runaway motion bounded ~16x |
-| [`PHASE3_SCENARIOS.md`](PHASE3_SCENARIOS.md) | Phase 3 scenarios 1-3: minimum navigable passage 0.70 m, blocked-route behaviour |
+| [`PHASE3_SCENARIOS.md`](PHASE3_SCENARIOS.md) | Phase 3 scenarios 1-5: minimum navigable passage 1.20 m (corrected), blocked-route and recovery behaviour |
 | [`evidence/phase3/README.md`](evidence/phase3/README.md) | Raw Phase 3 test evidence |
 
 ## Conventions used in these documents

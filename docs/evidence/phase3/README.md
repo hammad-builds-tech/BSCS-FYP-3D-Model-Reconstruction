@@ -14,7 +14,8 @@ Ubuntu 26.04.1 / ROS 2 Lyrical / Gazebo 10.5.0, with
 |---|---|
 | `watchdog_results.csv` | One row per watchdog experiment. **Primary result file.** Includes the rows that are INVALID and why — see below. |
 | `wd_<case>_<run>.trace` | Raw Gazebo ground-truth pose samples (~10 Hz) for one run: `x y z qx qy qz qw @unix_time`. Velocity in the CSV is differentiated from these. |
-| `scenario_runs.jsonl` | One JSON object per obstacle-scenario run (Scenarios 1-5). **Primary scenario result file.** |
+| `scenario_runs.jsonl` | One JSON object per obstacle-scenario run (Scenarios 1-5), 24 runs. Summary statistics ONLY -- **not independently recomputable** (see below). |
+| `scenario_runs_s2_repeat.jsonl` | The 21 Nov 2026 Scenario 2 repeat, 18 runs. Carries the **raw trajectory** and obstacle geometry, so every number is recomputable. **This is the file to cite for Scenario 2.** |
 
 ## Reading `scenario_runs.jsonl`
 
@@ -28,6 +29,44 @@ Rows that must NOT be cited:
 | `s1_three_boxes`, `s1_spaced` | Genuine FAILs, kept deliberately: they document the 0.60 m head-on limit of the approved envelope. Superseded as a *capability* test by `s1_slalom`. |
 
 **Zero real collisions occurred across all 24 runs.**
+
+## Verifying the evidence
+
+```bash
+scripts/phase3/verify_scenario_runs.py docs/evidence/phase3/scenario_runs_s2_repeat.jsonl
+```
+
+Recomputes `goal_error_m`, `min_clearance_m`, `executed_m`, `ratio`,
+`collided` and `samples` from each record's stored raw path and reports any
+disagreement. Current status:
+
+| File | Result |
+|---|---|
+| `scenario_runs_s2_repeat.jsonl` | **18/18 reproduce, 0 failed** |
+| `scenario_runs.jsonl` | **24/24 UNVERIFIABLE** -- written before the fix, no raw path |
+
+The "unverifiable" verdict is the honest one: those 24 summaries cannot be
+checked without trusting the harness, which is precisely why the raw path is
+now stored. Tolerance is field-aware -- `executed_m` and `ratio` sum ~200
+samples each rounded to 4 dp, so a fixed 1 mm bound is not a valid criterion
+for them; the pointwise fields reproduce exactly.
+
+## Reading `scenario_runs_s2_repeat.jsonl`
+
+18 runs, 6 per gap: runs prefixed `x` shared one stack; runs prefixed `f`
+each had a **guaranteed-fresh stack** (full teardown, bring-up, and an
+assertion that `gz-sim-main` is alive and `collision_monitor` is `active`
+before the goal was sent). Both methods agree:
+
+| Gap | shared-stack | fresh-stack |
+|---|---|---|
+| 1.20 m | 3/3 PASS | 3/3 PASS |
+| 0.90 m | 0/3 | 0/3 |
+| 0.70 m | 0/3 | 0/3 |
+
+This **supersedes** the single-run Scenario 2 rows in `scenario_runs.jsonl`:
+the 0.70 m and 0.90 m passes there did not reproduce. See
+`docs/PHASE3_SCENARIOS.md` section 3.
 
 ## Reading `watchdog_results.csv`
 

@@ -391,8 +391,30 @@ def main():
         "samples": len(path),
         "verdict": verdict,
         "events": events,
+        # Unique per invocation. --run alone is not unique: a re-run of the
+        # same scenario after a harness artifact reused run id "1", which made
+        # two rows indistinguishable except by nav_result (audit finding,
+        # 21 Nov 2026).
+        "run_key": "%s/%s/%d" % (args.scenario, args.run, int(t0)),
+        "started_unix": round(t0, 3),
+        # Raw ground-truth trajectory, so goal_error_m, min_clearance_m,
+        # executed_m and ratio can all be INDEPENDENTLY RECOMPUTED from this
+        # file. Without it the summary numbers had to be taken on trust
+        # (audit finding, 21 Nov 2026). (t_since_goal_s, x, y), 4 dp.
+        "path": [[round(t, 3), round(x, 4), round(y, 4)] for (t, x, y) in path],
+        # Everything needed to re-derive clearance without reading the code.
+        "obstacles": [
+            {"model": m, "x": ox, "y": oy,
+             "half_x": MODEL_HALF.get(m, (0.20, 0.20))[0],
+             "half_y": MODEL_HALF.get(m, (0.20, 0.20))[1]}
+            for (m, ox, oy) in cfg["obstacles"]
+        ],
+        "removed_index": removal["index"] if removal else None,
+        "removed_at_s": removed_at,
+        "robot_half_width_m": HALF_WID,
+        "goal_tolerance_m": GOAL_TOLERANCE,
     }
-    print(json.dumps(row))
+    print(json.dumps({k: v for k, v in row.items() if k != "path"}))
     if args.json:
         with open(args.json, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")

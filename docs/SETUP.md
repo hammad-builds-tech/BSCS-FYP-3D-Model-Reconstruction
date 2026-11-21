@@ -36,6 +36,34 @@ install them. Required and checked on both machines: the Nav2 stack
 `dwb_plugins`), plus `ros_gz_sim`, `ros_gz_bridge`, `tf2_ros`, `cv_bridge`,
 `sensor_msgs_py` and `rviz2`.
 
+### Extra package required for Phase 3
+
+`nav2_collision_monitor` is **not** part of the base install and is **not**
+needed for Phase 1 or Phase 2. Phase 3 puts it in the velocity command
+chain, so install it before running any Phase 3 bring-up:
+
+```bash
+sudo apt-get install -y ros-lyrical-nav2-collision-monitor
+```
+
+Notes:
+
+- The candidate is **1.5.2** while the rest of the Nav2 stack here is
+  **1.5.1**. `apt` installs it as a single new package with no upgrades to
+  any other Nav2 package, and the 1.5.2 binary links the 1.5.1 shared
+  libraries cleanly (`ldd` resolves, and the node reaches `active`). This
+  pairing is verified only on the two machines in `CLAUDE.md` section 6.
+- `nav2_common` is **not** installed. The launch file shipped *inside*
+  `nav2_collision_monitor` imports `nav2_common.launch.RewrittenYaml` and
+  therefore **cannot run here**; the project's own
+  `phase3_navigation.launch.py` does not use it.
+- `scripts/phase3/run_system_phase3.sh` refuses to start if the package is
+  missing, rather than silently bringing up the unguarded Phase 2 chain.
+
+Phase 3 background and limitations:
+[`PHASE3_COLLISION_MONITOR.md`](PHASE3_COLLISION_MONITOR.md),
+[`PHASE3_COMMAND_WATCHDOG.md`](PHASE3_COMMAND_WATCHDOG.md).
+
 **Keep conda out of ROS terminals.** `rclpy` and `cv_bridge` are built
 against the *system* python, numpy and OpenCV. An active conda environment
 puts its own python first on `PATH` and `import rclpy` then fails with the
