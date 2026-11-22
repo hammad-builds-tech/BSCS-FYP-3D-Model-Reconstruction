@@ -67,6 +67,54 @@ wait_for() {
     warn "$label NOT ready after ${limit}s"; return 1
 }
 
+# Fatal variant. The 21 Nov 2026 incident was caused by wait_for's return
+# value being IGNORED by every caller: a gate printed "NOT ready after 90s"
+# and the script went on to announce "PHASE 3 UP" anyway, after which three
+# scenario runs executed against a dead simulator. Readiness gates must
+# abort the bring-up, never warn and continue.
+require() {
+    local label="$1"
+    if ! wait_for "$@"; then
+        err "ABORTING: $label never became ready."
+        err "Refusing to announce PHASE 3 UP with an unverified stack --"
+        err "scenario results from such a stack are worthless."
+        teardown_and_die
+    fi
+}
+
+teardown_and_die() {
+    err "Tearing down the partial stack."
+    bash "$FYP_ROOT/scripts/phase3/stop_stack_phase3.sh" >/dev/null 2>&1 || true
+    exit 1
+}
+
+# A previous stack still serving /clock and /scan is what made the stale
+# gates pass. Refuse to start until the machine is actually clear.
+assert_no_stale_stack() {
+    local n_gz n_nav n_cm n_wd
+    # Bracketed first character so the pattern cannot match this script's
+    # own command line (or the shell that launched it) -- the same
+    # self-match that has repeatedly killed terminals in this project.
+    # `pgrep -fc` prints "0" AND exits 1 when nothing matches, so the
+    # idiom `$(pgrep -fc ... || echo 0)` yields the two-line string "0\n0"
+    # and every [ -gt ] below fails with "integer expected" -- which bash
+    # treats as false, silently disabling this guard. Counting lines instead
+    # always yields exactly one integer.
+    n_gz=$(pgrep -f '[g]z-sim-main' 2>/dev/null | wc -l)
+    n_nav=$(pgrep -f '[n]av2_controller/controller_server' 2>/dev/null | wc -l)
+    n_cm=$(pgrep -f '[n]av2_collision_monitor/collision_monitor' 2>/dev/null | wc -l)
+    n_wd=$(pgrep -f '[p]hase3/cmd_vel_watchdog' 2>/dev/null | wc -l)
+    if [ "$n_gz" -gt 0 ] || [ "$n_nav" -gt 0 ] || [ "$n_cm" -gt 0 ] || [ "$n_wd" -gt 0 ]; then
+        err "Stale processes still running after teardown:"
+        err "  gz-sim-main=$n_gz controller_server=$n_nav collision_monitor=$n_cm watchdog=$n_wd"
+        err "A leftover stack keeps serving /clock and /scan, which is exactly"
+        err "how a previous bring-up passed its gates against a dead simulator."
+        err "Run scripts/phase3/stop_stack_phase3.sh and retry."
+        exit 1
+    fi
+    info "No stale project processes -- clean slate confirmed"
+}
+
 info "Stopping any stale project processes"
 # Patterns are deliberately specific. A bare `pkill -f collision_monitor`
 # also matches any shell whose command line merely mentions the string --
@@ -79,22 +127,25 @@ pkill -f "launch/navigation\.launch\.py"                       2>/dev/null
 pkill -f "launch/phase3_navigation\.launch\.py"                2>/dev/null
 pkill -f "nav2_collision_monitor/collision_monitor"            2>/dev/null
 sleep 3
+assert_no_stale_stack
 
 # ---- Phase A: Gazebo world + robot + bridge (Phase 2 file, unchanged) ----
 info "Phase A: Gazebo + robot + ros_gz_bridge (log: /tmp/fyp_p3_sim.log)"
 setsid nohup ros2 launch indoor_nav_gazebo simulation.launch.py \
     > /tmp/fyp_p3_sim.log 2>&1 < /dev/null &
-wait_for "/clock flowing" 90 bash -c \
-  "source /opt/ros/lyrical/setup.bash && source $FYP_ROOT/ros2_ws/install/setup.bash \
-   && timeout 12 ros2 topic hz /clock --window 10 2>/dev/null | grep -q 'average rate'"
+# Check the simulator PROCESS first: /clock alone proved nothing.
+require "gz-sim-main process" 90 bash -c "pgrep -f '[g]z-sim-main' >/dev/null"
+require "robot spawned (ground truth readable)" 90 bash -c \
+  "timeout 10 gz topic -e -t /world/indoor_world/pose/info -n 1 2>/dev/null \
+   | grep -q 'fyp_robot'"
 
 # ---- Phase B: depth -> scan + map server + AMCL (Phase 2 file, unchanged) ----
 info "Phase B: depth bridge + depth_to_scan + map_server + AMCL (log: /tmp/fyp_p3_loc.log)"
 setsid nohup ros2 launch indoor_nav_costmap localization.launch.py \
     > /tmp/fyp_p3_loc.log 2>&1 < /dev/null &
-wait_for "/scan flowing" 90 bash -c \
+require "AMCL publishing map->odom" 90 bash -c \
   "source /opt/ros/lyrical/setup.bash && source $FYP_ROOT/ros2_ws/install/setup.bash \
-   && timeout 12 ros2 topic hz /scan --window 5 2>/dev/null | grep -q 'average rate'"
+   && timeout 12 ros2 run tf2_ros tf2_echo map odom 2>/dev/null | grep -q Translation"
 
 # ---- Phase C: Nav2 behind Collision Monitor (Phase 3 file) ----
 info "Phase C: Nav2 + Collision Monitor (log: /tmp/fyp_p3_nav.log)"
@@ -102,31 +153,36 @@ setsid nohup ros2 launch indoor_nav_costmap phase3_navigation.launch.py \
     > /tmp/fyp_p3_nav.log 2>&1 < /dev/null &
 
 for n in controller_server planner_server behavior_server bt_navigator collision_monitor; do
-    wait_for "lifecycle: $n active" 90 bash -c \
+    require "lifecycle: $n active" 90 bash -c \
       "source /opt/ros/lyrical/setup.bash && source $FYP_ROOT/ros2_ws/install/setup.bash \
        && timeout 10 ros2 lifecycle get /$n 2>/dev/null | grep -q '^active'"
 done
 
-# ---- Verify the chain really is gated, not just configured ----
+# ---- Final readiness gate: FATAL, and based on measured properties ----
+#
+# Everything above confirms processes and lifecycle states. This last gate
+# confirms the stack is actually *working*: the sim clock advancing, sensor
+# stamps fresh against that clock, the full TF chain resolvable, and the
+# command pipeline wired end to end. It is the check that would have caught
+# the 21 Nov 2026 stale-stack incident, where /clock and /scan both existed
+# but Gazebo was dead.
 echo
-info "Verifying the command chain"
-NAV_SUBS=$(timeout 12 ros2 topic info /cmd_vel_nav   2>/dev/null | grep -oP 'Subscription count: \K\d+')
-SAFE_SUBS=$(timeout 12 ros2 topic info /cmd_vel_safe 2>/dev/null | grep -oP 'Subscription count: \K\d+')
-OUT_PUBS=$(timeout 12 ros2 topic info /cmd_vel       2>/dev/null | grep -oP 'Publisher count: \K\d+')
-info "  /cmd_vel_nav  subscribers : ${NAV_SUBS:-0}  (expect 1: collision_monitor)"
-info "  /cmd_vel_safe subscribers : ${SAFE_SUBS:-0}  (expect 1: cmd_vel_watchdog)"
-info "  /cmd_vel      publishers  : ${OUT_PUBS:-0}  (expect 1: cmd_vel_watchdog)"
-if pgrep -f "phase3/cmd_vel_watchdo[g]\.py" >/dev/null 2>&1; then
-    info "  cmd_vel_watchdog         : RUNNING"
-else
-    err "  cmd_vel_watchdog         : NOT RUNNING — a lost publisher will leave the robot driving"
+info "Final readiness verification (clock / sensors / TF / command chain)"
+if ! /usr/bin/python3 "$FYP_ROOT/scripts/phase3/check_stack_ready.py" --window 6; then
+    err "Stack failed final readiness verification."
+    err "NOT announcing PHASE 3 UP. Do not run scenarios against this stack."
+    teardown_and_die
 fi
 
-if timeout 10 ros2 node list 2>/dev/null | grep -qx "/collision_monitor"; then
-    info "  collision_monitor node   : RUNNING ($(timeout 8 ros2 lifecycle get /collision_monitor 2>/dev/null))"
-else
-    err "  collision_monitor node   : NOT RUNNING — the chain is UNPROTECTED"
+# Watchdog is a plain process, not a lifecycle node, so check it separately.
+if ! pgrep -f "phase3/cmd_vel_watchdo[g]\.py" >/dev/null 2>&1; then
+    err "cmd_vel_watchdog is NOT running."
+    err "Without it, a lost publisher leaves the robot driving on the last"
+    err "command (gz VelocityControl latches indefinitely: measured 2.78-2.81 m)."
+    teardown_and_die
 fi
+info "  cmd_vel_watchdog         : RUNNING"
+info "  collision_monitor        : $(timeout 8 ros2 lifecycle get /collision_monitor 2>/dev/null)"
 
 echo
 info "PHASE 3 UP."

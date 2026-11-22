@@ -92,5 +92,18 @@ for pat in "${phase3_patterns[@]}"; do
 done
 echo "[P3] Phase 3 processes remaining: $remaining"
 
+# Clear the ros2 CLI daemon's discovery cache.
+#
+# Measured 22 Nov 2026: a daemon left running for ~29 minutes reported TEN
+# phantom nodes (controller_server, planner_server, both costmaps, ...) with
+# no matching processes. With that polluted state, a fresh Nav2 bring-up
+# would not activate -- controller_server never reached `active` and the
+# bring-up aborted twice in a row. `ros2 daemon stop` made the node list
+# correctly empty and the very next bring-up succeeded with every gate green.
+#
+# The daemon respawns on demand, so stopping it costs nothing but a moment.
+echo "[P3] stopping the ros2 CLI daemon (stale discovery cache blocks bring-up)"
+timeout 20 ros2 daemon stop >/dev/null 2>&1 || true
+
 echo "[P3] handing over to the Phase 2 teardown (exec)"
 exec bash docs/evidence/phase1/scripts/stop_stack.sh

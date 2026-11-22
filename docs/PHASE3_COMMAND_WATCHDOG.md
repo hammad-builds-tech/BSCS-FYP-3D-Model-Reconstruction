@@ -198,6 +198,52 @@ crash, publisher crash, publisher stop — now produces a bounded stop within
   and `docs/evidence/phase1/scripts/stop_stack.sh`.
 - No commits, no pushes.
 
+## 7a. Bring-up readiness (hardened 22 Nov 2026)
+
+`run_system_phase3.sh` previously gated on `ros2 topic hz /clock` and
+`ros2 topic hz /scan`. Both pass against a **stale** stack: on 21 Nov it
+reported `/clock flowing ready (0s)` and `/scan flowing ready (0s)` while
+Gazebo was not running and Nav2 never activated, then announced
+`PHASE 3 UP`. Three scenario runs executed against a dead simulator before
+the robot's total immobility gave it away. The root cause was that
+`wait_for`'s return value was **ignored by every caller**.
+
+Now:
+
+* a `require` wrapper **aborts and tears down** on any failed gate -- no gate
+  can warn and continue;
+* a clean-slate assertion refuses to start while a previous stack is alive;
+* Phase A checks the **`gz-sim-main` process** and that the robot's ground
+  truth is readable, not merely that `/clock` exists;
+* Phase B requires AMCL to publish `map -> odom`;
+* all five lifecycle gates are fatal;
+* a final `check_stack_ready.py` verifies **measured** properties: the sim
+  clock advancing, `/scan` and depth stamps fresh against that clock, the
+  full TF chain (`map->odom`, `odom->base_link`,
+  `base_link->sim_depth_scan`), and the command pipeline wired end to end.
+  It uses its own rclpy node, so it does **not** depend on the `ros2` CLI
+  daemon.
+
+Verified both ways: with nothing running it reports **9 failed checks** and
+exits 1; on a healthy stack all nine pass.
+
+### A stale ros2 CLI daemon blocks Nav2 activation
+
+Found while validating the above. A `ros2-daemon` left running ~29 minutes
+reported **ten phantom nodes** with no matching processes. With that cache
+polluted, Nav2 would not activate: `controller_server` never reached
+`active` and the hardened bring-up aborted **twice in a row** (correctly --
+the old script would have announced success). `ros2 daemon stop` made the
+node list correctly empty and the next bring-up succeeded with every gate
+green. `stop_stack_phase3.sh` now stops the daemon as part of teardown.
+
+Two pre-existing shell defects were also fixed: `pgrep -fc` prints `0` *and*
+exits 1 when nothing matches, so `$(pgrep -fc ... || echo 0)` yielded the
+two-line string `"0\n0"` and every `[ -gt ]` comparison failed with
+"integer expected" -- silently disabling the clean-slate guard; and patterns
+are now bracketed (`[g]z-sim-main`) so they cannot match the script's own
+command line.
+
 ## 8. Teardown — use the Phase 3 script
 
 `scripts/phase3/stop_stack_phase3.sh` was added because the Phase 1
