@@ -1,0 +1,39 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# ---------------------------------------------------------------------------
+# Phase 4 recovery: keep the *.backup files TRACKED.
+#
+# The repository root .gitignore has a blanket `*.backup` rule (line 62) for
+# scratch files. Here those two files are the opposite of scratch:
+#
+#   app/build.gradle.kts.backup        -- the project's own ORIGINAL module
+#                                         build script (4 Sep 2026, 1585 B).
+#                                         The live app/build.gradle.kts was
+#                                         truncated to 0 bytes on 5 Sep, so
+#                                         this file is the only surviving
+#                                         record of the working configuration
+#                                         and the baseline the repair is
+#                                         derived from.
+#   gradle/wrapper/*.properties.backup -- the original wrapper pointing at the
+#                                         official distribution URL, before it
+#                                         was repointed at a local file:// zip.
+#
+# Without these negations `git add android` silently skips both and the
+# recovery baseline is lost again. Do not remove.
+# ---------------------------------------------------------------------------
+!app/build.gradle.kts.backup
+!gradle/wrapper/gradle-wrapper.properties.backup
