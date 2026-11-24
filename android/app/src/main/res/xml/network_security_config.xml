@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MAIN (and therefore RELEASE) network security policy: cleartext DENIED.
+
+  This is the strict default. The debug source set overlays a permissive copy
+  of this same resource name; release builds get this file, so a release APK
+  cannot speak plain ws:// or http:// no matter what address the user enters.
+
+  WHY CLEARTEXT IS NEEDED IN DEVELOPMENT AT ALL
+  =============================================
+  The existing backend serves an unencrypted WebSocket:
+
+      backend/api/main.py  ==>  @app.websocket("/ws/video")
+      run_backend.sh       ==>  uvicorn, bind 0.0.0.0, port 8000
+
+  There is no TLS termination in front of it, so the uplink URL is
+  ws://<laptop-ip>:8000/ws/video, which Android has blocked by default since
+  API 28. The app targets API 37. Rather than weaken the whole app, cleartext
+  is enabled ONLY in the debug build, and only for lab use on a private
+  RFC 1918 Wi-Fi network between one phone and one laptop.
+
+  WHY PRODUCTION MUST USE WSS
+  ===========================
+  Over ws:// the camera stream is unauthenticated and unencrypted: anyone on
+  the same Wi-Fi can read the frames of the room being mapped, and nothing
+  stops them connecting to /ws/video themselves and injecting frames into the
+  depth pipeline. For any deployment outside a controlled lab the backend must
+  terminate TLS and the app must connect over wss://, at which point this
+  cleartext exception can be deleted rather than merely restricted.
+
+  A NOTE ON SCOPING
+  =================
+  It would be preferable to permit cleartext only for the laptop's subnet.
+  Android's Network Security Configuration does NOT support CIDR or subnet
+  rules: the domain element accepts hostnames and literal IP addresses only.
+  The backend address is also user-configurable at runtime and DHCP-assigned,
+  so it cannot be enumerated here at build time. The honest description of the
+  debug policy is therefore "cleartext allowed in debug builds", not
+  "cleartext allowed for the local subnet"; the narrower claim would be false.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

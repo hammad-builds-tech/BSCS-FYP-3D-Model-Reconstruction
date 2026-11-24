@@ -1,15 +1,27 @@
-cat > ~/FYP/MiDaS/mobile/android/app/src/main/java/com/fyp/reconstruction/MainActivity.kt <<'EOF'
-package com.fyp.reconstruction
+package com.example.fyp3d
 
 import android.Manifest
+import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.InputType
+import android.util.Log
 import android.view.Gravity
+import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -23,25 +35,131 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * Phase 4A — minimum viable camera-to-backend uplink.
+ *
+ * HISTORY OF THIS FILE
+ * --------------------
+ * The version recovered in commit 1ff73cb could not compile: the whole file
+ * was wrapped in a shell heredoc (`cat > ... <<'EOF'` on line 1, `EOF` on
+ * line 401) that had been pasted into the editor instead of being run in a
+ * terminal, and it declared `package com.fyp.reconstruction` while living in
+ * `com/example/fyp3d/`. The forensic timeline in
+ * docs/PHASE4_ANDROID_RECOVERY.md shows it was written four days AFTER the
+ * module build script was emptied, so it had never been compiled even once.
+ *
+ * The original implementation's structure and approach are PRESERVED here --
+ * View-based UI (FrameLayout + PreviewView + status text + one button),
+ * CameraX ImageAnalysis, OkHttp WebSocket, NV21 -> JPEG. What changed is
+ * listed in the report; the substantive fixes are the stride-correct YUV
+ * conversion, the configurable backend address, the frame-rate limit and the
+ * reconnect logic.
+ *
+ * WIRE PROTOCOL -- read from backend/api/main.py, NOT invented, NOT modified:
+ *   - endpoint  WS /ws/video on port 8000
+ *   - uplink    ONE BINARY MESSAGE PER FRAME, raw JPEG bytes only.
+ *               No JSON envelope. No sequence header. No timestamp.
+ *   - downlink  one JSON text message per frame, acknowledging receipt
+ *
+ * The backend has no field for a sequence number or a capture timestamp --
+ * `frame_count` there is a server-side counter incremented on arrival. Adding
+ * either would be a coordinated both-side protocol change and is deliberately
+ * out of scope (see docs/PHASE4_ANDROID_RECOVERY.md section 7).
+ *
+ * The ack means RECEIVED, not DEPTH READY: MiDaS runs on a separate backend
+ * thread and is latest-frame-wins, so depth appears at the model's own rate
+ * (~5.3 fps on the project's Quadro T2000) regardless of uplink rate. That is
+ * why the uplink is rate-limited rather than run flat out.
+ */
 class MainActivity : ComponentActivity() {
 
-    private var previewView: PreviewView? = null
-    private var webSocket: WebSocket? = null
+    private companion object {
+        const val TAG = "FYP3D"
 
-    private val httpClient = OkHttpClient()
+        const val PREFS = "fyp3d_backend"
+        const val KEY_HOST = "host"
+        const val KEY_PORT = "port"
+        const val KEY_FPS = "fps"
+
+        /** Backend default from run_backend.sh (`--port 8000`). */
+        const val DEFAULT_PORT = 8000
+
+        /**
+         * Default uplink limit. Matched to the measured backend inference rate
+         * (~5.3 fps, DPT-Hybrid-384 on a Quadro T2000). Sending faster only
+         * wastes phone battery and Wi-Fi: the backend overwrites
+         * `pending_frame`, so surplus frames are dropped server-side anyway.
+         */
+        const val DEFAULT_FPS = 5.0
+
+        const val JPEG_QUALITY = 70
+
+        /**
+         * Drop frames rather than queue them when the socket is backed up.
+         * OkHttp's send() buffers without bound, so on a slow link an
+         * unthrottled producer grows the queue until the process dies. Two
+         * frames of slack absorbs jitter; beyond that the newest frame is
+         * dropped, which is the same latest-frame-wins policy the backend
+         * itself uses.
+         */
+        const val MAX_QUEUED_BYTES = 2L * 1024 * 1024
+
+        val IPV4 = Regex(
+            "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}" +
+                "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$"
+        )
+    }
+
+    private var previewView: PreviewView? = null
+    private lateinit var hostInput: EditText
+    private lateinit var portInput: EditText
+    private lateinit var fpsInput: EditText
+    private lateinit var statusText: TextView
+    private lateinit var countsText: TextView
+    private lateinit var scanButton: Button
+
+    private lateinit var prefs: SharedPreferences
+
+    private val httpClient = OkHttpClient.Builder()
+        // A silently half-open Wi-Fi socket is the common failure on a phone
+        // that walks out of range; pings surface it as onFailure so the
+        // reconnect path can run instead of the stream just stopping.
+        .pingInterval(5, TimeUnit.SECONDS)
+        .build()
+
     private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val ui = Handler(Looper.getMainLooper())
+
+    @Volatile
+    private var webSocket: WebSocket? = null
 
     @Volatile
     private var scanning = false
 
-    private val serverUrl =
-        "ws://192.168.2.107:8000/ws/video"
+    /** Guards against two in-flight connect attempts after a fast retry. */
+    @Volatile
+    private var connecting = false
+
+    private val framesSent = AtomicInteger(0)
+    private val acksReceived = AtomicInteger(0)
+    private val framesDropped = AtomicInteger(0)
+    private val lastSentAtMs = AtomicLong(0L)
+
+    @Volatile
+    private var minIntervalMs = (1000.0 / DEFAULT_FPS).toLong()
+
+    private var reconnectAttempt = 0
+    private var reconnectPending = false
 
     private val cameraPermission =
         registerForActivityResult(
@@ -50,6 +168,7 @@ class MainActivity : ComponentActivity() {
             if (granted) {
                 startCamera()
             } else {
+                setStatus("Camera permission denied", Color.RED)
                 Toast.makeText(
                     this,
                     "Camera permission required",
@@ -61,81 +180,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val root = FrameLayout(this)
+        prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-        previewView = PreviewView(this)
-
-        root.addView(
-            previewView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-        )
-
-        val statusText = TextView(this)
-        statusText.text = "Ready to scan"
-        statusText.textSize = 20f
-        statusText.setTextColor(0xFFFFFFFF.toInt())
-        statusText.gravity = Gravity.CENTER
-
-        val statusParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT
-        )
-
-        statusParams.gravity =
-            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        statusParams.bottomMargin = 140
-
-        root.addView(statusText, statusParams)
-
-        val scanButton = Button(this)
-        scanButton.text = "START 3D SCAN"
-
-        val buttonParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT
-        )
-
-        buttonParams.gravity =
-            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        buttonParams.bottomMargin = 50
-
-        root.addView(scanButton, buttonParams)
-
-        scanButton.setOnClickListener {
-
-            scanning = !scanning
-
-            if (scanning) {
-
-                scanButton.text = "STOP SCAN"
-                statusText.text = "Scanning..."
-
-                connectWebSocket()
-
-                Toast.makeText(
-                    this,
-                    "3D Scan Started",
-                    Toast.LENGTH_SHORT
-                ).show()
-
-            } else {
-
-                scanButton.text = "START 3D SCAN"
-                statusText.text = "Ready to scan"
-
-                webSocket?.close(
-                    1000,
-                    "Scan stopped"
-                )
-
-                webSocket = null
-            }
-        }
-
-        setContentView(root)
+        setContentView(buildUi())
+        restoreSettings()
 
         if (
             ContextCompat.checkSelfPermission(
@@ -145,257 +193,432 @@ class MainActivity : ComponentActivity() {
         ) {
             startCamera()
         } else {
-            cameraPermission.launch(
-                Manifest.permission.CAMERA
-            )
+            cameraPermission.launch(Manifest.permission.CAMERA)
         }
     }
 
-    private fun connectWebSocket() {
+    // ------------------------------------------------------------------ UI
 
-        if (webSocket != null) return
+    private fun buildUi(): FrameLayout {
+        val root = FrameLayout(this)
 
-        val request = Request.Builder()
-            .url(serverUrl)
-            .build()
+        previewView = PreviewView(this)
+        root.addView(
+            previewView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
 
-        webSocket = httpClient.newWebSocket(
-            request,
-            object : WebSocketListener() {
+        // ---- backend address panel (top) --------------------------------
+        val panel = LinearLayout(this)
+        panel.orientation = LinearLayout.VERTICAL
+        panel.setBackgroundColor(0xB0000000.toInt())
+        panel.setPadding(24, 24, 24, 24)
 
-                override fun onOpen(
-                    webSocket: WebSocket,
-                    response: okhttp3.Response
-                ) {
-                    runOnUiThread {
-                        Toast.makeText(
-                            this@MainActivity,
-                            "Backend Connected",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                }
+        hostInput = EditText(this)
+        hostInput.hint = "Backend IPv4 (e.g. 192.168.1.50)"
+        hostInput.inputType = InputType.TYPE_CLASS_TEXT
+        hostInput.setSingleLine()
+        hostInput.setHintTextColor(0xFF999999.toInt())
+        hostInput.setTextColor(Color.WHITE)
+        panel.addView(hostInput, wide())
 
-                override fun onMessage(
-                    webSocket: WebSocket,
-                    text: String
-                ) {
-                    println("BACKEND: $text")
-                }
+        portInput = EditText(this)
+        portInput.hint = "Port (default $DEFAULT_PORT)"
+        portInput.inputType = InputType.TYPE_CLASS_NUMBER
+        portInput.setSingleLine()
+        portInput.setHintTextColor(0xFF999999.toInt())
+        portInput.setTextColor(Color.WHITE)
+        panel.addView(portInput, wide())
 
-                override fun onFailure(
-                    webSocket: WebSocket,
-                    t: Throwable,
-                    response: okhttp3.Response?
-                ) {
-                    println(
-                        "WebSocket ERROR: ${t.message}"
-                    )
-                    this@MainActivity.webSocket = null
-                }
+        fpsInput = EditText(this)
+        fpsInput.hint = "Uplink fps (default $DEFAULT_FPS)"
+        fpsInput.inputType =
+            InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        fpsInput.setSingleLine()
+        fpsInput.setHintTextColor(0xFF999999.toInt())
+        fpsInput.setTextColor(Color.WHITE)
+        panel.addView(fpsInput, wide())
 
-                override fun onClosed(
-                    webSocket: WebSocket,
-                    code: Int,
-                    reason: String
-                ) {
-                    println(
-                        "WebSocket CLOSED: $reason"
-                    )
-                    this@MainActivity.webSocket = null
+        val panelParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        )
+        panelParams.gravity = Gravity.TOP
+        root.addView(panel, panelParams)
+
+        // ---- status + counters + button (bottom) -------------------------
+        val bottom = LinearLayout(this)
+        bottom.orientation = LinearLayout.VERTICAL
+        bottom.gravity = Gravity.CENTER_HORIZONTAL
+        bottom.setBackgroundColor(0xB0000000.toInt())
+        bottom.setPadding(24, 16, 24, 32)
+
+        statusText = TextView(this)
+        statusText.textSize = 16f
+        statusText.gravity = Gravity.CENTER
+        statusText.setTextColor(Color.WHITE)
+        statusText.text = "Idle — enter the backend IP, then START"
+        bottom.addView(statusText, wide())
+
+        countsText = TextView(this)
+        countsText.textSize = 14f
+        countsText.gravity = Gravity.CENTER
+        countsText.setTextColor(0xFFCCCCCC.toInt())
+        countsText.text = "sent 0 · acked 0 · dropped 0"
+        bottom.addView(countsText, wide())
+
+        scanButton = Button(this)
+        scanButton.text = "START STREAMING"
+        scanButton.setOnClickListener { onScanButton() }
+        bottom.addView(scanButton, wide())
+
+        val bottomParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        )
+        bottomParams.gravity = Gravity.BOTTOM
+        root.addView(bottom, bottomParams)
+
+        return root
+    }
+
+    private fun wide() = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT
+    )
+
+    private fun setStatus(msg: String, colour: Int = Color.WHITE) {
+        ui.post {
+            statusText.text = msg
+            statusText.setTextColor(colour)
+        }
+    }
+
+    private fun refreshCounts() {
+        ui.post {
+            countsText.text = "sent ${framesSent.get()} · " +
+                "acked ${acksReceived.get()} · " +
+                "dropped ${framesDropped.get()}"
+        }
+    }
+
+    // ------------------------------------------------- settings persistence
+
+    private fun restoreSettings() {
+        // Defaults to EMPTY, never to a developer's own LAN address: the
+        // recovered source hard-coded ws://192.168.2.107:8000/ws/video, an
+        // address on a different /24 from the current laptop and therefore
+        // permanently unreachable. A wrong default is worse than none.
+        hostInput.setText(prefs.getString(KEY_HOST, "") ?: "")
+        portInput.setText(prefs.getInt(KEY_PORT, DEFAULT_PORT).toString())
+        fpsInput.setText(prefs.getFloat(KEY_FPS, DEFAULT_FPS.toFloat()).toString())
+    }
+
+    private fun saveSettings(host: String, port: Int, fps: Double) {
+        prefs.edit()
+            .putString(KEY_HOST, host)
+            .putInt(KEY_PORT, port)
+            .putFloat(KEY_FPS, fps.toFloat())
+            .apply()
+    }
+
+    // --------------------------------------------------------- stream control
+
+    private fun onScanButton() {
+        if (scanning) {
+            stopStreaming("Stopped by user")
+            return
+        }
+
+        val host = hostInput.text.toString().trim()
+        if (!IPV4.matches(host)) {
+            setStatus("Invalid IPv4 address: \"$host\"", Color.RED)
+            return
+        }
+
+        val port = portInput.text.toString().trim().toIntOrNull()
+        if (port == null || port !in 1..65535) {
+            setStatus("Invalid port (expected 1-65535)", Color.RED)
+            return
+        }
+
+        val fps = fpsInput.text.toString().trim().toDoubleOrNull()
+        if (fps == null || fps <= 0.0 || fps > 30.0) {
+            setStatus("Invalid fps (expected 0 < fps <= 30)", Color.RED)
+            return
+        }
+
+        minIntervalMs = (1000.0 / fps).toLong()
+        saveSettings(host, port, fps)
+
+        framesSent.set(0)
+        acksReceived.set(0)
+        framesDropped.set(0)
+        lastSentAtMs.set(0L)
+        reconnectAttempt = 0
+        refreshCounts()
+
+        scanning = true
+        scanButton.text = "STOP STREAMING"
+        connect(host, port)
+    }
+
+    private fun endpointFor(host: String, port: Int) = "ws://$host:$port/ws/video"
+
+    private fun connect(host: String, port: Int) {
+        if (connecting || webSocket != null) return
+        connecting = true
+
+        val url = endpointFor(host, port)
+        setStatus("Connecting to $url …")
+        Log.i(TAG, "connecting: $url")
+
+        val request = Request.Builder().url(url).build()
+
+        httpClient.newWebSocket(request, object : WebSocketListener() {
+
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                this@MainActivity.webSocket = webSocket
+                connecting = false
+                reconnectAttempt = 0
+                Log.i(TAG, "connected: $url")
+                setStatus("Connected to $host:$port — streaming", Color.GREEN)
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                // The backend sends one JSON ack per received frame. It is
+                // counted, not parsed: it carries no field this client needs,
+                // and "depth_available" refers to the backend's latest depth
+                // map, not to this frame.
+                acksReceived.incrementAndGet()
+                refreshCounts()
+            }
+
+            override fun onFailure(
+                webSocket: WebSocket,
+                t: Throwable,
+                response: Response?
+            ) {
+                this@MainActivity.webSocket = null
+                connecting = false
+                val why = t.message ?: t.javaClass.simpleName
+                Log.w(TAG, "websocket failure: $why", t)
+                // Surface the real reason. "ECONNREFUSED" (backend down),
+                // "ETIMEDOUT" (wrong subnet / AP isolation) and
+                // "CLEARTEXT communication not permitted" are three very
+                // different problems and the user cannot tell them apart from
+                // a generic message.
+                setStatus("Disconnected: $why", Color.RED)
+                scheduleReconnect(host, port)
+            }
+
+            override fun onClosed(
+                webSocket: WebSocket,
+                code: Int,
+                reason: String
+            ) {
+                this@MainActivity.webSocket = null
+                connecting = false
+                Log.i(TAG, "closed: $code $reason")
+                if (scanning) {
+                    // The backend closes with 1008 when FYP_VIDEO_STREAM_LOCK=1
+                    // is set, which otherwise looks like an unexplained drop.
+                    setStatus("Closed by server: $code $reason", Color.YELLOW)
+                    scheduleReconnect(host, port)
                 }
             }
-        )
+        })
     }
+
+    private fun scheduleReconnect(host: String, port: Int) {
+        if (!scanning || reconnectPending) return
+        reconnectPending = true
+        reconnectAttempt++
+        // 1s, 2s, 4s, 8s, capped at 10s. Bounded so a backend that comes back
+        // is picked up promptly, without hammering a host that is simply absent.
+        val delayMs = minOf(10_000L, 1000L shl minOf(reconnectAttempt - 1, 3))
+        setStatus("Reconnecting in ${delayMs / 1000}s (attempt $reconnectAttempt)…", Color.YELLOW)
+        ui.postDelayed({
+            reconnectPending = false
+            if (scanning) connect(host, port)
+        }, delayMs)
+    }
+
+    private fun stopStreaming(reason: String) {
+        scanning = false
+        reconnectPending = false
+        // Graceful close: code 1000 is a normal closure, which lets the
+        // backend log "PHONE DISCONNECTED" instead of a dropped socket.
+        webSocket?.close(1000, reason)
+        webSocket = null
+        ui.post { scanButton.text = "START STREAMING" }
+        setStatus("Idle — $reason")
+    }
+
+    // ----------------------------------------------------------------- camera
 
     private fun startCamera() {
-
         val view = previewView ?: return
+        val future = ProcessCameraProvider.getInstance(this)
 
-        val future =
-            ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            try {
+                val provider = future.get()
 
-        future.addListener(
-            Runnable {
+                val preview = Preview.Builder().build()
+                preview.setSurfaceProvider(view.surfaceProvider)
 
-                try {
+                // KEEP_ONLY_LATEST: the analyzer receives the newest frame and
+                // older ones are discarded by CameraX rather than queued. With
+                // a ~5 fps uplink against a 30 fps camera this is what keeps
+                // latency flat instead of accumulating a backlog.
+                val analysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
 
-                    val provider = future.get()
-
-                    val preview =
-                        Preview.Builder().build()
-
-                    preview.setSurfaceProvider(
-                        view.surfaceProvider
-                    )
-
-                    val analysis =
-                        ImageAnalysis.Builder()
-                            .setBackpressureStrategy(
-                                ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
-                            )
-                            .build()
-
-                    analysis.setAnalyzer(
-                        cameraExecutor,
-                        object : ImageAnalysis.Analyzer {
-
-                            override fun analyze(
-                                imageProxy: ImageProxy
-                            ) {
-                                if (scanning) {
-                                    sendFrame(imageProxy)
-                                } else {
-                                    imageProxy.close()
-                                }
-                            }
-                        }
-                    )
-
-                    provider.unbindAll()
-
-                    provider.bindToLifecycle(
-                        this,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview,
-                        analysis
-                    )
-
-                } catch (e: Exception) {
-
-                    e.printStackTrace()
-
-                    Toast.makeText(
-                        this,
-                        "Camera ERROR: ${e.message}",
-                        Toast.LENGTH_LONG
-                    ).show()
+                analysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                    handleFrame(imageProxy)
                 }
 
-            },
-            ContextCompat.getMainExecutor(this)
-        )
+                provider.unbindAll()
+                provider.bindToLifecycle(
+                    this,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    analysis
+                )
+                Log.i(TAG, "camera bound")
+            } catch (e: Exception) {
+                Log.e(TAG, "camera bind failed", e)
+                setStatus("Camera error: ${e.message}", Color.RED)
+            }
+        }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun sendFrame(
-        imageProxy: ImageProxy
-    ) {
-
+    /**
+     * Called on [cameraExecutor] for every analyzer frame.
+     *
+     * Every path through this method closes the ImageProxy exactly once. A
+     * leaked proxy stalls the whole analyzer after a handful of frames,
+     * because CameraX will not deliver another until one is released.
+     */
+    private fun handleFrame(imageProxy: ImageProxy) {
         try {
+            if (!scanning) return
 
-            val socket = webSocket
+            val socket = webSocket ?: return
 
-            if (socket == null) {
-                imageProxy.close()
+            // ---- rate limit -------------------------------------------
+            val now = System.currentTimeMillis()
+            if (now - lastSentAtMs.get() < minIntervalMs) return
+
+            // ---- backpressure: drop rather than queue ------------------
+            if (socket.queueSize() > MAX_QUEUED_BYTES) {
+                framesDropped.incrementAndGet()
+                refreshCounts()
                 return
             }
 
-            val jpeg = imageProxyToJpeg(imageProxy)
+            val jpeg = imageProxyToJpeg(imageProxy) ?: return
 
-            if (jpeg != null) {
-                socket.send(
-                    ByteString.of(*jpeg)
-                )
+            if (socket.send(ByteString.of(*jpeg))) {
+                lastSentAtMs.set(now)
+                framesSent.incrementAndGet()
+            } else {
+                // send() returns false once the socket is closing/closed.
+                framesDropped.incrementAndGet()
             }
-
+            refreshCounts()
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "frame handling failed", e)
         } finally {
             imageProxy.close()
         }
     }
 
-    private fun imageProxyToJpeg(
-        image: ImageProxy
-    ): ByteArray? {
+    // ------------------------------------------------------- JPEG conversion
 
-        if (
-            image.format !=
-            ImageFormat.YUV_420_888
-        ) {
+    private fun imageProxyToJpeg(image: ImageProxy): ByteArray? {
+        if (image.format != ImageFormat.YUV_420_888) {
+            Log.w(TAG, "unexpected analyzer format: ${image.format}")
             return null
         }
 
-        val yBuffer =
-            image.planes[0].buffer
-        val uBuffer =
-            image.planes[1].buffer
-        val vBuffer =
-            image.planes[2].buffer
+        val nv21 = yuv420888ToNv21(image) ?: return null
 
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val nv21 =
-            ByteArray(ySize + uSize + vSize)
-
-        yBuffer.get(
-            nv21,
-            0,
-            ySize
-        )
-
-        val uBytes = ByteArray(uSize)
-        uBuffer.get(uBytes)
-
-        val vBytes = ByteArray(vSize)
-        vBuffer.get(vBytes)
-
-        var position = ySize
-        var i = 0
-
-        while (i < vSize) {
-
-            nv21[position++] = vBytes[i]
-
-            if (i < uSize) {
-                nv21[position++] = uBytes[i]
-            }
-
-            i++
+        val out = ByteArrayOutputStream()
+        val yuv = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        if (!yuv.compressToJpeg(Rect(0, 0, image.width, image.height), JPEG_QUALITY, out)) {
+            Log.w(TAG, "compressToJpeg failed")
+            return null
         }
+        val jpeg = out.toByteArray()
 
-        val yuv =
-            YuvImage(
-                nv21,
-                ImageFormat.NV21,
-                image.width,
-                image.height,
-                null
-            )
-
-        val output =
-            ByteArrayOutputStream()
-
-        yuv.compressToJpeg(
-            Rect(
-                0,
-                0,
-                image.width,
-                image.height
-            ),
-            60,
-            output
-        )
-
-        return output.toByteArray()
+        // The analyzer delivers frames in SENSOR orientation. On a phone held
+        // upright the back sensor is typically rotated 90 degrees, so an
+        // unrotated frame reaches MiDaS on its side. MiDaS would still return
+        // a plausible-looking depth map, which is exactly the kind of silent
+        // error that is hard to catch later -- and the downstream ROS
+        // depth_to_scan geometry assumes an upright image. Rotating here costs
+        // a decode/re-encode, which is affordable at ~5 fps.
+        val degrees = image.imageInfo.rotationDegrees
+        return if (degrees == 0) jpeg else rotateJpeg(jpeg, degrees)
     }
 
-    override fun onDestroy() {
+    private fun rotateJpeg(jpeg: ByteArray, degrees: Int): ByteArray? {
+        val src: Bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
+        return try {
+            val matrix = Matrix()
+            matrix.postRotate(degrees.toFloat())
+            val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+            val out = ByteArrayOutputStream()
+            rotated.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+            if (rotated != src) rotated.recycle()
+            out.toByteArray()
+        } catch (e: Exception) {
+            Log.w(TAG, "rotation failed, sending unrotated", e)
+            jpeg
+        } finally {
+            src.recycle()
+        }
+    }
 
-        scanning = false
-
-        webSocket?.close(
-            1000,
-            "Activity destroyed"
+    /**
+     * Bridge from CameraX's [ImageProxy] to the platform-free converter.
+     *
+     * The conversion itself lives in [YuvConverter] so it can be unit-tested
+     * on the JVM without a device; see the comments there for why that
+     * matters. This method only unpacks the planes.
+     */
+    private fun yuv420888ToNv21(image: ImageProxy): ByteArray? {
+        if (image.width <= 0 || image.height <= 0) return null
+        val y = image.planes[0]
+        val u = image.planes[1]
+        val v = image.planes[2]
+        return YuvConverter.toNv21(
+            width = image.width,
+            height = image.height,
+            yBuffer = y.buffer, yRowStride = y.rowStride, yPixelStride = y.pixelStride,
+            uBuffer = u.buffer, uRowStride = u.rowStride, uPixelStride = u.pixelStride,
+            vBuffer = v.buffer, vRowStride = v.rowStride, vPixelStride = v.pixelStride,
         )
+    }
 
+    // ---------------------------------------------------------------- teardown
+
+    override fun onDestroy() {
+        scanning = false
+        reconnectPending = false
+        webSocket?.close(1000, "Activity destroyed")
         webSocket = null
-
         cameraExecutor.shutdown()
-
+        // Without this the OkHttp dispatcher's threads and connection pool
+        // outlive the Activity.
+        httpClient.dispatcher.executorService.shutdown()
+        httpClient.connectionPool.evictAll()
         super.onDestroy()
     }
 }
-EOF

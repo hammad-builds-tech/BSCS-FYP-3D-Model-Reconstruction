@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DEBUG ONLY network security policy: cleartext permitted.
+
+  This file lives in the `debug` source set and overlays the same resource
+  name from `main`. The override applies to debug builds only; the release
+  build keeps main's cleartextTrafficPermitted="false". Verify after a build
+  with:
+
+      aapt dump xmltree on the APK, for the file
+      res/xml/network_security_config.xml
+
+  It exists because the project's backend serves an unencrypted WebSocket
+  (ws://<laptop-ip>:8000/ws/video) with no TLS in front of it, and Android has
+  blocked cleartext by default since API 28 while this app targets API 37.
+
+  SCOPE, STATED ACCURATELY
+  ========================
+  This permits cleartext for ALL destinations in the debug build. It is not
+  restricted to the laptop's subnet, because Android's Network Security
+  Configuration has no CIDR or subnet rule (the domain element matches
+  hostnames and literal addresses only) and the backend IP is entered at
+  runtime and DHCP-assigned, so it cannot be listed at build time.
+
+  Acceptable here because the debug APK is installed by hand on one lab phone
+  on a private Wi-Fi network. It must never be the basis of a release build;
+  production requires wss:// and the deletion of this exception.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

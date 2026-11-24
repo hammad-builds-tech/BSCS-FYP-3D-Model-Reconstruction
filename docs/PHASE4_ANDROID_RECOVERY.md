@@ -271,3 +271,370 @@ Carried forward from the Phase 4A audit, all measured rather than assumed:
     produce plausible-looking depth from a corrupted frame, so a saved
     `backend/uploads/` JPEG must be inspected **visually** rather than
     trusting that depth appeared.
+
+---
+
+# Milestone 2 — repair and first successful build
+
+**Date:** 24 November 2026. **Branch:** `phase-4-android`.
+**Baseline:** the as-found state preserved in `1ff73cb`.
+
+**No physical device was connected at any point during this milestone, and no
+physical-device test is claimed.** `adb devices` was empty throughout. What is
+claimed is exactly this: the application now compiles, and the resulting APK
+has been inspected and contains what it must.
+
+## 11. Restored Gradle configuration
+
+`app/build.gradle.kts` was restored from `app/build.gradle.kts.backup`. Every
+value is carried over **unchanged**:
+
+| Setting | Value | Confirmed by |
+|---|---|---|
+| `namespace` / `applicationId` | `com.example.fyp3d` | backup + APK badging |
+| `compileSdk` | 37 | backup + `compileSdkVersion='37'` |
+| `minSdk` | 26 | backup + `sdkVersion:'26'` |
+| `targetSdk` | 37 | backup + `targetSdkVersion:'37'` |
+| Java source/target | 11 | backup |
+| Compose | enabled | backup |
+| `versionCode` / `versionName` | 1 / "1.0" | backup |
+
+Nothing was upgraded. AGP stays **9.4.0**, Kotlin **2.2.10**, Gradle
+**9.6.0**, Compose BOM **2026.02.01**.
+
+### No standalone Kotlin plugin was added
+
+The backup declares only `com.android.application` and
+`org.jetbrains.kotlin.plugin.compose` — there is no
+`org.jetbrains.kotlin.android`. That looks wrong, but the 5 Sep APK contains
+compiled Kotlin, so AGP 9.x evidently provides built-in Kotlin support. The
+original plugin set was therefore preserved, and the build confirms it:
+`compileDebugKotlin` executes and succeeds. Adding the standalone plugin would
+have been an unrequested toolchain change made on a false premise.
+
+### Gradle wrapper portability fixed
+
+| | `distributionUrl` | `validateDistributionUrl` |
+|---|---|---|
+| As found | `file:///home/hammad/Downloads/gradle-9.6.0-bin.zip` | `false` |
+| Now | `https://services.gradle.org/distributions/gradle-9.6.0-bin.zip` | `true` |
+
+Restored from `gradle-wrapper.properties.backup` — i.e. the project's own
+original — so the repository now builds on any machine. The version is
+unchanged at 9.6.0 and `distributionSha256Sum` was already present.
+
+**Why it had been repointed at a local file.** The Gradle dist cache shows
+two entries for 9.6.0, one keyed by each URL. The HTTPS-keyed entry held a
+`gradle-9.6.0-bin.zip.part` of **14,186,780 of 140,681,093 bytes** and no
+`.ok` marker: the original download died about 10 % in. Switching to a
+hand-downloaded `file://` zip was a reasonable workaround for a bad
+connection, not carelessness — it just cannot be committed.
+
+**Local cache seeded so the build stays offline-capable.** Changing the URL
+changes Gradle's cache key, which would normally force a fresh 140 MB
+download. The hand-downloaded zip's SHA-256 is
+`bbaeb2fe…a529a01`, **identical to the `distributionSha256Sum` the wrapper
+already declared**, so it is byte-for-byte the official distribution. It was
+copied into the HTTPS-keyed cache entry and marked `.ok`, after confirming
+with `diff -r` that the two already-extracted distributions were identical
+(422 library jars each) and that `bin/gradle --version` reports Gradle 9.6.0.
+This is a change to the local Gradle cache only — **no repository file and no
+system package** — and it means this machine builds without network access
+while the committed wrapper is fully portable.
+
+## 12. Dependencies added
+
+Added to `gradle/libs.versions.toml` with **exact pins**. The existing
+Compose entries were not touched and nothing was upgraded.
+
+| Dependency | Version | Why this version |
+|---|---|---|
+| `androidx.camera:camera-core` | **1.5.0** | already in this machine's Gradle cache **and present in the 5 Sep APK**, so proven against AGP 9.4.0 / compileSdk 37 |
+| `androidx.camera:camera-camera2` | 1.5.0 | Camera2 backend for the above |
+| `androidx.camera:camera-lifecycle` | 1.5.0 | `ProcessCameraProvider` |
+| `androidx.camera:camera-view` | 1.5.0 | `PreviewView` |
+| `com.squareup.okhttp3:okhttp` | **4.12.0** | cached, stable, Kotlin-native WebSocket client |
+| `com.squareup.okio:okio` | **3.6.0** | **exactly what okhttp 4.12.0's POM declares** |
+
+Checks made rather than assumed:
+
+- `camera-core` 1.5.0's AAR declares `minSdkVersion 23` ≤ our 26.
+- OkHttp 4.12.0's POM declares `okio 3.6.0`, so the explicit Okio pin cannot
+  introduce a conflicting version. Okio is pinned at all because
+  `MainActivity` uses `okio.ByteString` directly, not only through OkHttp.
+- OkHttp 4.12.0's POM asks for `kotlin-stdlib-jdk8 1.8.21`; Gradle resolves
+  that upward to the project's 2.2.10.
+
+**`camera-video` was deliberately omitted** — nothing records video, and
+leaving it out is what makes the `RECORD_AUDIO` removal clean.
+
+## 13. Kotlin repairs
+
+`MainActivity.kt`: 401 lines as found → 624 lines repaired and extended.
+
+| # | Repair |
+|---|---|
+| 1 | Removed the shell heredoc: `cat > … <<'EOF'` (line 1) and `EOF` (line 401). **No shell command remains in any Kotlin file.** |
+| 2 | `package com.fyp.reconstruction` → `package com.example.fyp3d`, matching both the `namespace` and the directory `com/example/fyp3d/`. |
+| 3 | Added the missing imports the extended code needs; all imports resolve (clean compile, **zero warnings**). |
+| 4 | Preserved the original approach: View-based UI, CameraX `ImageAnalysis`, OkHttp WebSocket, NV21 → JPEG. Not rewritten into Compose, not replaced with a placeholder. |
+| 5 | Extracted the YUV conversion into `YuvConverter.kt` so it is unit-testable off-device (section 15). |
+
+The `ui/theme/*.kt` Compose files are untouched and still compile, which is
+why the Compose dependencies remain required.
+
+`.MainActivity` in the manifest resolves against the `com.example.fyp3d`
+namespace; the APK confirms
+`launchable-activity: name='com.example.fyp3d.MainActivity'`.
+
+## 14. Camera implementation
+
+- `ImageAnalysis` with **`STRATEGY_KEEP_ONLY_LATEST`**: CameraX discards older
+  frames instead of queuing them, so latency stays flat under a ~5 fps uplink
+  against a ~30 fps camera.
+- Analysis runs on a single-thread executor; **every path through
+  `handleFrame` closes the `ImageProxy` exactly once** in a `finally`. A
+  leaked proxy stalls the analyzer permanently, because CameraX will not
+  deliver another frame until one is released.
+- Resolution is left at the `ImageAnalysis` default (≈640×480) rather than
+  configured, to avoid depending on API details of
+  `ResolutionSelector` in this CameraX version.
+- **Rotation is applied.** The analyzer delivers frames in *sensor*
+  orientation, so on an upright phone the back sensor is typically 90°
+  rotated. An unrotated frame would reach MiDaS on its side; MiDaS would
+  still return a plausible depth map, and the downstream `depth_to_scan`
+  geometry assumes an upright image. Frames are therefore rotated by
+  `imageInfo.rotationDegrees` when non-zero. This costs a decode/re-encode,
+  affordable at ~5 fps.
+
+## 15. The YUV conversion is verified, not merely reviewed
+
+This is the one part of the milestone that can fail **silently**: a stride
+mistake still yields a decodable JPEG, so MiDaS produces plausible depth and
+nothing reports an error. It was therefore extracted into
+`YuvConverter.toNv21(...)` — which takes `ByteBuffer`s and strides, no Android
+types — and tested on the JVM.
+
+The recovered implementation made two assumptions that real hardware breaks:
+
+1. `rowStride == width`. False when rows are hardware-aligned; a flat bulk
+   copy then drags padding into the image and shears it progressively.
+2. chroma `pixelStride == 1`. False on semi-planar devices, where U and V are
+   views into one interleaved allocation with `pixelStride == 2`; reading them
+   as packed duplicates and swaps chroma.
+
+`./gradlew testDebugUnitTest` → **6 tests, 0 failures, 0 errors** (plus the
+pre-existing `ExampleUnitTest`):
+
+| Test | What it pins down |
+|---|---|
+| `packed planes round-trip exactly` | fast path correct; chroma interleaved **V first** |
+| `row padding in the luma plane is not copied into the image` | padding filled with a poison byte must appear nowhere in the output |
+| `semi-planar chroma with pixelStride 2 is de-interleaved correctly` | the real-device layout the original mishandled |
+| `luma pixelStride greater than one is honoured` | slow path correct |
+| `output size is always 12 bits per pixel` | 2×2 up to 1280×720 |
+| `the recovered naive algorithm is provably wrong on padded rows` | **the suite is not vacuous** |
+
+That last test reproduces the original buggy algorithm and asserts it
+*disagrees* with the fixed converter on the same input — a test that cannot
+fail would prove nothing, so the suite's discriminating power is itself
+asserted. If anyone later "simplifies" the converter back to a bulk copy,
+these tests fail.
+
+**Limit of this evidence:** the tests prove the conversion is correct *for the
+stride combinations they construct*. They cannot prove what strides a
+particular phone's camera will actually report. A real frame must still be
+inspected by eye in Milestone 3.
+
+## 16. WebSocket implementation
+
+Follows the existing contract exactly; **the backend was not modified**.
+
+| Requirement | Implementation |
+|---|---|
+| Endpoint | `ws://<host>:<port>/ws/video` |
+| Binary frames | `socket.send(ByteString.of(*jpeg))` |
+| Raw JPEG only | no envelope, no header, no prefix |
+| Ack handling | `onMessage(text)` increments an ack counter |
+| Connection state | shown on screen, colour-coded |
+| Frame counter | `sent · acked · dropped` |
+| Graceful disconnect | `close(1000, reason)` → backend logs `PHONE DISCONNECTED` |
+| Reconnect | 1 s, 2 s, 4 s, 8 s, capped at 10 s, only while streaming |
+
+Deliberate choices:
+
+- **No sequence numbers or timestamps.** The protocol has no field for either
+  and `frame_count` is server-side; adding them is a coordinated both-side
+  change (section 7) and was explicitly out of scope.
+- **Rate limited, default 5 fps**, editable on screen and persisted. Matched
+  to the measured ~5.3 fps backend inference rate. Sending faster is pure
+  waste: the backend overwrites `pending_frame`, so surplus frames are
+  dropped server-side anyway.
+- **Bounded queue.** `OkHttp.send()` buffers without limit, so an unthrottled
+  producer on a slow link grows the queue until the process dies. If
+  `queueSize()` exceeds 2 MB the newest frame is dropped and counted — the
+  same latest-frame-wins policy the backend uses.
+- **5 s ping interval.** A half-open Wi-Fi socket is the usual failure when a
+  phone walks out of range; pings turn that into an `onFailure` that the
+  reconnect path can act on, instead of the stream silently stopping.
+- **Errors are surfaced verbatim.** `ECONNREFUSED` (backend down),
+  `ETIMEDOUT` (wrong subnet or AP isolation) and `CLEARTEXT communication not
+  permitted` are three different faults that a generic "connection failed"
+  would hide. The server's `1008 stream locked` close
+  (`FYP_VIDEO_STREAM_LOCK=1`) is also reported as such.
+- `onDestroy` closes the socket, shuts down the camera executor, and shuts
+  down OkHttp's dispatcher and connection pool.
+
+## 17. Backend address configuration
+
+The hard-coded `ws://192.168.2.107:8000/ws/video` is **gone** — confirmed
+absent from the built APK's dex.
+
+- Editable **IPv4** field, validated by regex with per-octet 0–255 bounds.
+- Editable **port**, default **8000**, validated to 1–65535.
+- Editable **fps**, default 5, validated to 0 < fps ≤ 30.
+- Persisted in `SharedPreferences` (`fyp3d_backend`), restored on launch.
+- **Default host is empty**, never a developer's own address: the previous
+  default pointed at a different `/24` from this laptop and was permanently
+  unreachable. A wrong default is worse than no default.
+
+## 18. Network configuration
+
+| | Debug | Release |
+|---|---|---|
+| `cleartextTrafficPermitted` | **`true`** | **`false`** |
+| Source | `app/src/debug/res/xml/network_security_config.xml` | `app/src/main/res/xml/network_security_config.xml` |
+
+Implemented as a **source-set resource overlay** on one resource name, with
+`android:networkSecurityConfig` declared once in the main manifest. **No
+blanket `android:usesCleartextTraffic` is used anywhere.**
+
+Verified in the built artefacts with `aapt2 dump xmltree` — not assumed from
+the source:
+
+- debug APK → `cleartextTrafficPermitted=true`
+- release APK (`app-release-unsigned.apk`) → `cleartextTrafficPermitted=false`
+
+**Why development uses unencrypted WebSocket.** The backend serves plain
+`ws://` on `0.0.0.0:8000` with no TLS in front of it, and Android has blocked
+cleartext by default since API 28 while this app targets API 37. Rather than
+weaken the whole app, cleartext is enabled only in the debug build, for lab
+use on a private RFC 1918 network between one phone and one laptop.
+
+**Why production must use `wss://`.** Over `ws://` the stream is
+unauthenticated and unencrypted: anyone on the same Wi-Fi can read the frames
+of the room being mapped, and nothing stops them connecting to `/ws/video`
+and injecting frames into the depth pipeline. Outside a controlled lab the
+backend must terminate TLS and the app connect over `wss://` — at which point
+the cleartext exception is **deleted**, not merely narrowed.
+
+**Scope stated accurately.** The debug policy permits cleartext to **all**
+destinations, not just the laptop's subnet. Android's Network Security
+Configuration has **no CIDR or subnet rule** — `<domain>` matches hostnames
+and literal addresses only — and the backend IP is entered at runtime and
+DHCP-assigned, so it cannot be enumerated at build time. Claiming
+"cleartext allowed for the local subnet" would be false; the honest statement
+is "cleartext allowed in debug builds".
+
+Manifest also changed: **`INTERNET` added** (it was missing, so socket
+creation threw before any packet left the device), `CAMERA` retained,
+`RECORD_AUDIO` **removed** — nothing records audio (no `MediaRecorder`, no
+`AudioRecord`, no `camera-video`), so requesting it was a needless privacy ask.
+
+## 19. Build instructions and results
+
+```
+cd android
+export JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64   # or Studio's JBR 25
+echo "sdk.dir=$HOME/Android/Sdk" > local.properties    # gitignored, per machine
+./gradlew clean assembleDebug
+./gradlew testDebugUnitTest
+```
+
+`gradle/gradle-daemon-jvm.properties` pins `toolchainVersion=25`, so a JDK 25
+is required; `java-25-openjdk-amd64` and `/opt/android-studio/jbr` both work.
+`local.properties` is intentionally not committed (machine-specific
+`sdk.dir`); `ANDROID_HOME` works instead.
+
+| Run | Result |
+|---|---|
+| `./gradlew clean assembleDebug` | **BUILD SUCCESSFUL in 22 s**, 37 tasks |
+| Kotlin compile warnings | **0** |
+| `./gradlew testDebugUnitTest` | **BUILD SUCCESSFUL**, 6 + 1 tests, 0 failures |
+| `./gradlew assembleRelease` | **BUILD SUCCESSFUL** (unsigned; built only to verify the cleartext policy) |
+
+**APK location:** `android/app/build/outputs/apk/debug/app-debug.apk`
+(14,461,127 bytes, sha256 `4848bc8b091ac991004962533b7e67c1906c78cefe7492cc7dbdc0d69de1d8eb`).
+Gitignored, as build outputs should be.
+
+Note the first build **failed**, and correctly: AGP rejected
+`network_security_config.xml` because XML comments may not contain `--`, which
+the explanatory comments used as underlines and in `uvicorn --host` / `aapt
+--file` examples. Recorded because the fix is in the committed files and the
+failure is reproducible from the logs.
+
+## 20. APK verification
+
+All probes run against the **newly built** APK, not the September one.
+
+| Check | Result |
+|---|---|
+| APK produced from repaired source | ✅ sha256 `4848bc8b…`, differs from the Sep APK `8791da08…` |
+| Application id | ✅ `com.example.fyp3d` |
+| Launchable activity | ✅ `com.example.fyp3d.MainActivity` |
+| `INTERNET` in merged manifest | ✅ present |
+| `CAMERA` | ✅ present |
+| `RECORD_AUDIO` | ✅ **0 occurrences** |
+| OkHttp classes | ✅ **725** `okhttp3` references |
+| `WebSocket` symbols | ✅ **96** (the Sep APK had **0**) |
+| Okio classes | ✅ 196 `Lokio/` references |
+| CameraX packages | ✅ all 4 (`core`, `camera2`, `lifecycle`, `view`) |
+| `YuvConverter` class | ✅ present |
+| `/ws/video` endpoint string | ✅ present |
+| Old hard-coded IP | ✅ **0 occurrences** of `192.168.2.107` |
+| `SharedPreferences` store | ✅ `fyp3d_backend` present |
+| Unresolved imports / Kotlin errors | ✅ none — clean compile |
+
+`android:networkSecurityConfig` was read from the **merged manifest** and via
+`aapt2`. The system `aapt` (1:14~beta1-5) returns nothing for it and cannot
+dump the compiled `res/xml` — a limitation of that old tool against
+compileSdk 37 binary XML, not a build problem. `aapt2` from build-tools
+36.0.0 reads both correctly. In the release APK resource paths are renamed,
+so the config was located by scanning for the `network-security-config`
+element rather than by filename.
+
+## 21. Known limitations after Milestone 2
+
+**Nothing below is a claim of success; these are the open items.**
+
+1. **No physical-device test has happened.** No phone has ever been connected
+   to this project. Everything above is a build-and-inspect result.
+2. **The streaming path has never executed.** It compiles and the classes are
+   in the APK; not one frame has been captured, converted, or sent. The
+   WebSocket client, the reconnect logic, the rate limiter and the rotation
+   path are all **unexecuted code**.
+3. **The YUV conversion is verified only for constructed stride
+   combinations.** What a given phone reports is unknown; a real uploaded
+   frame must be checked by eye.
+4. **Cleartext is permitted to all destinations in debug builds** — not
+   subnet-scoped, because Android offers no such rule.
+5. **The release build is unsigned** and has no signing config. It was built
+   only to verify the cleartext policy; it is not a distributable artefact.
+6. **No UDP discovery client.** The backend responder exists and is unused;
+   manual IP entry is deliberate for the first connection.
+7. **`ufw` is active and its rules were never read** (needs sudo), so whether
+   ports 8000/51315 are reachable from the phone is **unknown**.
+8. **Helper scripts still target the wrong package.**
+   `scripts/phone_stream_watchdog.sh` and `scripts/fyp30_record30.py`
+   hard-code `com.fyp.reconstruction`; the real id is `com.example.fyp3d`, so
+   their `adb am start` calls fail silently. Left untouched here because they
+   are Phase 1/2/3 files.
+9. **No sequence numbers or timestamps**, by design — needs a both-side
+   protocol change.
+10. **`~/AndroidStudioProjects/FYP3D` still holds the original broken files.**
+    Nothing there was deleted or modified. The repository's `android/`
+    directory is now the canonical copy and is what should be opened in
+    Android Studio. The stale directory is a trap for a future session.
+11. **The rotation path decodes and re-encodes each frame**, costing CPU and a
+    second lossy JPEG pass. Acceptable at 5 fps; it would need replacing with
+    a YUV-domain rotation at higher rates.
