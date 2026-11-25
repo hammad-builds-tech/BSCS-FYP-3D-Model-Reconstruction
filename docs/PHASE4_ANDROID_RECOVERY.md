@@ -786,8 +786,9 @@ Measured:
 - phone -> gateway: **OK**; laptop -> gateway: **OK**
 - phone <-> laptop: **100% packet loss, both directions**
 - laptop ARP entry for the phone: **FAILED**, while the gateway is `REACHABLE`
-- both still associated to the same BSSID `ac:15:a2:5f:46:a0`, same SSID,
-  same IPs as Milestone 3 (laptop .106, phone .103)
+- both still associated to the **same access point** (identical BSSID and
+  SSID, redacted here), and the same IPs as Milestone 3 (laptop .106,
+  phone .103)
 
 A host firewall cannot break ARP, and neither IP changed, so this is **layer-2
 AP/client isolation on the router**, enabled at some point after Milestone 3.
@@ -846,10 +847,12 @@ rotation buckets (Milestones 2-4).
 | Probe | Milestone 4 | Milestone 5 |
 |---|---|---|
 | laptop -> phone ICMP | 100% loss | **0% loss** |
-| laptop ARP entry for the phone | `FAILED` | **resolved**, `f6:13:10:70:11:19` |
+| laptop ARP entry for the phone | `FAILED` | **resolved** to the phone's MAC |
 | phone -> laptop `GET /health` | not possible | **HTTP 200** |
 
-The MAC matches the one recorded in Milestone 3, so this is the same handset.
+The resolved MAC matched the address recorded in Milestone 3, so this is
+the same handset. The address itself is redacted: it identifies a personal
+device and is not needed to follow the argument.
 No router, firewall or network setting was changed by this project; the
 isolation was lifted externally.
 
