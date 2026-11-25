@@ -819,3 +819,148 @@ LAN address afterwards.
 6. The unexplained single disconnect from Milestone 3 was not reproduced and
    remains unexplained.
 7. Streaming still stops when the app is backgrounded (no foreground service).
+
+---
+
+# Milestone 5 — direct Wi-Fi streaming validation
+
+**Date:** 25 November 2026. **Branch:** `phase-4-android`, baseline `e3fff3b`.
+**Device:** Pixel 7 Pro, Android 16. **No USB forwarding was used.**
+
+Milestone 4's orientation tests had to run over `adb reverse` because the
+router had enabled AP client isolation. This milestone re-establishes and
+independently verifies **direct Wi-Fi** streaming, with USB used only for
+device control (install, launch, typing the address, reading logcat).
+
+## 31. What was already verified before this milestone
+
+Carried forward, not re-proven here: APK build and install, camera permission
+flow, the binary-JPEG protocol, ack handling, graceful disconnect, the
+stride-correct YUV conversion, and orientation correctness for all four
+rotation buckets (Milestones 2-4).
+
+## 32. Newly verified in Milestone 5
+
+### AP client isolation is gone
+
+| Probe | Milestone 4 | Milestone 5 |
+|---|---|---|
+| laptop -> phone ICMP | 100% loss | **0% loss** |
+| laptop ARP entry for the phone | `FAILED` | **resolved**, `f6:13:10:70:11:19` |
+| phone -> laptop `GET /health` | not possible | **HTTP 200** |
+
+The MAC matches the one recorded in Milestone 3, so this is the same handset.
+No router, firewall or network setting was changed by this project; the
+isolation was lifted externally.
+
+### The laptop's IP had changed
+
+**`192.168.1.106` -> `192.168.1.107`** (DHCP). The phone stayed at
+`192.168.1.103`. Any test reusing the old address would have failed with
+`EHOSTUNREACH` and looked like an application fault. The app's stored host was
+also still `127.0.0.1` from the Milestone 4 USB workaround.
+
+### Direct Wi-Fi streaming, proven by the peer address
+
+The decisive evidence is the backend's own connection log:
+
+```
+INFO:  192.168.1.103:45408 - "WebSocket /ws/video" [accepted]
+PHONE CONNECTED
+```
+
+The peer is the phone's **Wi-Fi address**. Over an `adb reverse` tunnel the
+peer appears as `127.0.0.1`, as it did throughout Milestone 4. Across the
+whole session the backend logged **no loopback WebSocket peer at all**, and
+`adb reverse --list` / `adb forward --list` were confirmed **empty** before,
+during and after the test.
+
+### Five-minute sustained test (direct Wi-Fi)
+
+| Metric | Value |
+|---|---|
+| Duration | **301 s** |
+| Frames received by the backend | **1402** (368 -> 1770) |
+| Effective FPS | **4.66** (limit 5.0, unchanged) |
+| Per-interval FPS | 4.52 - 4.70 across all ten intervals |
+| **Stalls** | **0** |
+| App counters | **sent 1984, acked 1983, dropped 0** |
+| Disconnect / reconnect events | **0** app-side; backend saw 1 connect, **0 disconnects** |
+| Invalid JPEGs rejected by the backend | **0** |
+| JPEGs written | 168 files touched in the window (the backend reuses filenames after its counter restarts, so the file *count* stays flat while mtimes advance) |
+| GPU utilisation | mean **83%**, range 75-92% |
+| GPU memory | **1248 MiB, constant -- no leak** |
+| GPU temperature | 60-63 C, no throttling |
+| MiDaS | `loaded`, `device: cuda`, `inference_active: true` throughout |
+
+The one-frame gap between sent and acked is simply the frame in flight.
+
+Screen-sleep was suppressed for the test window (`svc power stayon usb`,
+reverted afterwards). That is a *known, already-diagnosed* interruption from
+Milestone 4, not an unexplained one; suppressing it lets the five minutes
+measure network and stream stability rather than re-measuring the Android
+doze timer.
+
+### Physical frame inspection
+
+A received JPEG was opened and examined: a glass dining table with a pink
+basket of bananas, a spectacle case, wooden chairs and a bamboo mat.
+
+- **Orientation** upright -- chair slats vertical, table horizontal. 480x640
+  portrait, matching `physicalBucket=ROTATION_0`.
+- **Colours** correct -- yellow bananas, pink basket, brown wood, white wall.
+  A U/V swap would not survive this.
+- **No shearing** -- chair slats straight and parallel.
+- **No corruption** -- clean decode, full dynamic range, 68.7% bright pixels.
+
+### MiDaS verification
+
+| Check | Result |
+|---|---|
+| `/health` | `midas: loaded`, `device: cuda`, `depth_available: true` |
+| `/latest-depth` | `shape [640, 480]`, min 340.69, max 2372.57 |
+| `/latest-depth-image` | HTTP 200, PNG 480x640 8-bit grayscale |
+| Finite values | yes -- 0 NaN, 0 Inf |
+| Distinct depth values | **256** |
+| RGB / depth orientation | **agree**, dimensions identical (480x640) |
+
+Visually the depth reproduces the scene: nearest at the laptop in the
+foreground, receding to the far table and background, with the diagonal
+boundary matching the laptop screen edge in the RGB.
+
+## 33. Failed tests
+
+None. Every test attempted in this milestone passed.
+
+## 34. Environmental limitations observed
+
+1. **The laptop IP is DHCP-assigned and moved between milestones.** It must be
+   re-checked before every session; the app has no discovery client.
+2. **AP client isolation can reappear.** It blocked Milestone 4 entirely and
+   cleared without any action from this project, so it is outside our control
+   and must be re-verified each session (`ping` plus a phone-side `/health`).
+3. `ufw` is active; its rules were never read (needs `sudo`). Port 8000 is
+   demonstrably reachable from the phone, which is the behaviour that matters.
+
+## 35. Remaining defects
+
+1. **Streaming stops when the screen sleeps** (Activity pauses, CameraX
+   unbinds). Worked around for the test; a foreground service and wake lock
+   are the real fix.
+2. **Bucket-boundary flapping at ~45 degrees** between orientation buckets;
+   hysteresis would fix it.
+3. **No UDP discovery client**, so the backend IP must be typed in by hand
+   after every DHCP change. The backend responder already exists and is unused.
+4. The app's stored host persists across reinstalls and silently goes stale
+   when the laptop IP changes -- the failure then looks like a bug rather than
+   a configuration drift.
+5. Portrait orientation still costs a JPEG decode/rotate/re-encode per frame.
+
+## 36. Evidence
+
+Kept **outside** the public repository, at
+`FYP-data/phase4_evidence/milestone5_wifi_20261125/`: the inspected RGB frame,
+the paired RGB/depth pair, the depth PNG and colour-mapped render, the app
+counter capture, and the raw five-minute log. `backend/uploads/` and
+`backend/depth/output/` remain gitignored with zero tracked files, so no
+photographs of the room enter Git.
