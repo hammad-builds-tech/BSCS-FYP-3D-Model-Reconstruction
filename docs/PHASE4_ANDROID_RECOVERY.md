@@ -638,3 +638,184 @@ element rather than by filename.
 11. **The rotation path decodes and re-encodes each frame**, costing CPU and a
     second lossy JPEG pass. Acceptable at 5 fps; it would need replacing with
     a YUV-domain rotation at higher rates.
+
+---
+
+# Milestone 4 — physical camera orientation correction
+
+**Date:** 24 November 2026. **Branch:** `phase-4-android`.
+**Device:** Google Pixel 7 Pro (`cheetah`), **Android 16** (SDK 36), CameraX 1.5.0.
+**Baseline:** `d3e8441`.
+
+Milestone 3 established that frames reach the backend, colours are correct and
+the YUV stride handling works on real hardware, but that the transmitted image
+was **90 degrees from upright**. This milestone measures why, fixes it, and
+verifies the fix on the physical device.
+
+## 22. The defect, as observed in Milestone 3
+
+The app delivered a **480x640 portrait** JPEG whose contents were sideways.
+Rotating the saved frame 90 degrees counter-clockwise produced a correct
+upright image at **640x480 landscape** -- i.e. for that capture the correct
+action was *no rotation at all*, and the app had rotated by 90 anyway.
+
+## 23. Where rotation was applied (inspection, before any change)
+
+- `ImageAnalysis.Builder()` set **only** `setBackpressureStrategy(...)`.
+  **`targetRotation` was never set**, so CameraX used its default: the
+  **display rotation at bind time**.
+- Rotation was applied to **pixels**, once, in `imageProxyToJpeg`: the NV21
+  frame is JPEG-encoded, then if `imageInfo.rotationDegrees != 0` the JPEG is
+  decoded, rotated with a `Matrix`, and re-encoded.
+- So the implementation used metadata (`rotationDegrees`) to decide **how
+  much** to rotate, and then genuinely rotated pixels. There was no second,
+  independent correction -- the single rotation was simply being given the
+  wrong input.
+
+## 24. Diagnostic measurements
+
+Logging was added **first**, with no behaviour change, because the Milestone 3
+root cause was explicitly a hypothesis. It records the physical orientation
+(`OrientationEventListener`), the display rotation, `ImageAnalysis
+.targetRotation`, `imageInfo.rotationDegrees`, the raw buffer size and the
+**actual decoded output JPEG size**. It logs only when a value changes, never
+per frame.
+
+Measured on the Pixel 7 Pro with auto-rotate **locked to portrait**
+(`accelerometer_rotation = 0`):
+
+| # | physical bucket | display | targetRotation | rotationDegrees | raw | output JPEG |
+|---|---|---|---|---|---|---|
+| 1 | ROTATION_0 | ROTATION_0 | ROTATION_0 | **90** | 640x480 | 480x640 |
+| 2 | **ROTATION_90** | ROTATION_0 | ROTATION_0 | **90** | 640x480 | 480x640 |
+
+Row 2 is the proof. The device was physically turned to landscape -- the
+sensor reported `physical=303deg -> ROTATION_90` -- and **`rotationDegrees`
+did not change**, nor did the output geometry. The frame kept being rotated
+90 degrees to suit a portrait *display* while the camera was physically
+pointing at the world sideways.
+
+`rotationDegrees` therefore tracks the **display**, not the device. The
+Milestone 3 hypothesis is confirmed by measurement rather than assumed.
+
+## 25. Root cause
+
+`ImageAnalysis.targetRotation` defaulted to the display rotation. With
+auto-rotate locked to portrait the display rotation is pinned at
+`ROTATION_0` no matter how the phone is held, so CameraX computed a correction
+appropriate for a portrait display and the app faithfully applied it. The
+rotation code was correct; **its input was derived from the wrong thing**.
+
+## 26. Correction implemented
+
+`targetRotation` is now driven by the **physical** device orientation via
+`OrientationEventListener`, following the official CameraX rotation guidance.
+CameraX then recomputes `rotationDegrees` itself, and that value is still
+applied exactly **once**, in pixels, where it always was.
+
+- The azimuth-to-`Surface` mapping is the official one, and the inversion is
+  deliberate: a device rotated clockwise needs the image rotated
+  counter-clockwise, so 45..134 degrees maps to `ROTATION_270`, 135..224 to
+  `ROTATION_180`, 225..314 to `ROTATION_90`, otherwise `ROTATION_0`. Getting
+  this backwards converts a 90-degree error into a 270-degree one.
+- `ORIENTATION_UNKNOWN` (-1) is ignored and the previous value retained. This
+  is not a corner case: it is what the sensor reports with the phone lying
+  flat, which is exactly how it sat at the start of the Milestone 3 test.
+- `targetRotation` is written **only when the bucket changes**, not per event.
+- The listener is enabled when the camera binds and disabled in `onDestroy`,
+  alongside the other camera resources.
+- `canDetectOrientation()` is checked; a device without the sensor logs a
+  warning instead of silently doing nothing.
+- **No independent display-based correction was added.** There is exactly one
+  `targetRotation` assignment and exactly one pixel rotation in the file.
+
+The backend, the WebSocket protocol and the 5 fps limit are untouched.
+
+## 27. Physical verification
+
+Every capture below is a real JPEG received by the FastAPI backend from the
+Pixel 7 Pro and **inspected visually**, not inferred from metadata.
+
+| Case | physical | targetRotation | rotationDegrees | output | upright? |
+|---|---|---|---|---|---|
+| Portrait, auto-rotate **locked** | ROTATION_0 | ROTATION_0 | **90** | **480x640** | ✅ |
+| Landscape, auto-rotate **locked** | ROTATION_90 | **ROTATION_90** | **0** | **640x480** | ✅ |
+| Landscape, auto-rotate **on** | ROTATION_90 | ROTATION_90 | 0 | 640x480 | ✅ |
+
+`rotationDegrees` now responds to how the phone is **held**: 90 when upright,
+0 when sideways. In the landscape case the correct action is no rotation, and
+the app now does none -- the exact behaviour Milestone 3 showed was required.
+
+Visual inspection:
+
+- **Portrait** -- a desk scene: laptop screen upright with readable UI, a vase
+  standing vertically with flowers up, the table surface horizontal, a folder
+  lying flat. Colours natural (orange flowers orange, blue folder blue, white
+  vase white). No shearing; straight edges remain straight. Aspect 0.750.
+- **Landscape** -- a room: chair backs vertical with parallel vertical slats,
+  a wall-mounted shelf horizontal, laptop upright, table horizontal. Colours
+  natural. No shearing. Aspect 1.333.
+- **Auto-rotate on** -- upright, though motion-blurred because the phone was
+  being turned during capture.
+
+The first two were captured with auto-rotate **locked to portrait**, which is
+the condition that originally failed, so success criteria 1, 2 and 3 are all
+satisfied under that setting.
+
+## 28. Backend pipeline verification
+
+Unmodified FastAPI backend, real phone frames:
+
+| Check | Result |
+|---|---|
+| `/health` | `midas: loaded`, `device: cuda`, `video_stream_locked: false` |
+| Frames received | 1636+ during this milestone |
+| Depth shape | **[480, 640]** -- i.e. 640x480 landscape, matching the landscape input |
+| Depth validity | finite, no NaN, no Inf, **256 distinct values** |
+| Depth orientation | preserved; near/bright at the laptop screen and foreground table, far/dark at the back wall |
+| Uplink rate | **4.70 fps** (limit 5.0, unchanged) |
+| GPU memory | **1248 MiB** -- identical to Milestone 3, no growth |
+| GPU utilisation / temp | 75% / 63 C |
+| Unit tests | **7 tests, 0 failures, 0 errors** |
+
+## 29. Wi-Fi blocked during this milestone (environmental)
+
+Partway through, the phone could no longer reach the laptop over Wi-Fi.
+Measured:
+
+- phone -> gateway: **OK**; laptop -> gateway: **OK**
+- phone <-> laptop: **100% packet loss, both directions**
+- laptop ARP entry for the phone: **FAILED**, while the gateway is `REACHABLE`
+- both still associated to the same BSSID `ac:15:a2:5f:46:a0`, same SSID,
+  same IPs as Milestone 3 (laptop .106, phone .103)
+
+A host firewall cannot break ARP, and neither IP changed, so this is **layer-2
+AP/client isolation on the router**, enabled at some point after Milestone 3.
+It is an environmental change, not a regression in this code, and no network
+or firewall configuration was altered in response.
+
+To finish the orientation work -- which is transport-independent -- the test
+traffic was carried over USB with `adb reverse tcp:8000 tcp:8000`, and the
+app's host field set to `127.0.0.1`. **Wi-Fi streaming itself was proven in
+Milestone 3 and was not re-proven here.** The app's host was restored to the
+LAN address afterwards.
+
+## 30. Known limitations after Milestone 4
+
+1. **Wi-Fi is currently blocked by AP client isolation** (section 29). It must
+   be disabled on the router before wireless streaming works again.
+2. The diagnostic logging is deliberately **left in**. It is change-triggered,
+   not per frame, and it is what made this root cause provable; removing it
+   would make the next orientation question unanswerable.
+3. **180-degree and reverse-landscape cases were not physically tested.** Only
+   `ROTATION_0` and `ROTATION_90` occurred during the session. The mapping for
+   `ROTATION_180` and `ROTATION_270` is the official one but remains
+   **unverified on hardware**.
+4. A frame already in flight when the orientation changes may still carry the
+   previous rotation. Harmless at 5 fps, but it means a single frame around a
+   turn can be sideways.
+5. The rotation still costs a **decode/rotate/re-encode** per frame whenever
+   `rotationDegrees != 0` -- i.e. in portrait. In landscape it is now free.
+6. The unexplained single disconnect from Milestone 3 was not reproduced and
+   remains unexplained.
+7. Streaming still stops when the app is backgrounded (no foreground service).

@@ -11,12 +11,15 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.util.Log
 import android.view.Gravity
+import android.view.OrientationEventListener
+import android.view.Surface
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
@@ -160,6 +163,18 @@ class MainActivity : ComponentActivity() {
 
     private var reconnectAttempt = 0
     private var reconnectPending = false
+
+    // ---- Milestone 4 diagnostics (measurement only; no behaviour change) ---
+    private var imageAnalysis: ImageAnalysis? = null
+    private var orientationListener: OrientationEventListener? = null
+
+    /** Last physical-orientation bucket reported by the sensor, in degrees. */
+    @Volatile
+    private var lastOrientationBucket = -1
+
+    /** Signature of the last diagnostic line, so we log on CHANGE only. */
+    @Volatile
+    private var lastRotationSignature = ""
 
     private val cameraPermission =
         registerForActivityResult(
@@ -479,6 +494,8 @@ class MainActivity : ComponentActivity() {
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
 
+                imageAnalysis = analysis
+
                 analysis.setAnalyzer(cameraExecutor) { imageProxy ->
                     handleFrame(imageProxy)
                 }
@@ -491,6 +508,7 @@ class MainActivity : ComponentActivity() {
                     analysis
                 )
                 Log.i(TAG, "camera bound")
+                startOrientationListener()
             } catch (e: Exception) {
                 Log.e(TAG, "camera bind failed", e)
                 setStatus("Camera error: ${e.message}", Color.RED)
@@ -539,6 +557,133 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ------------------------------------------------- orientation diagnostics
+
+    /**
+     * MILESTONE 4, STEP 1 -- MEASUREMENT ONLY. This block changes no
+     * behaviour; it exists to test the Milestone 3 hypothesis that
+     * `imageInfo.rotationDegrees` tracks the DISPLAY rotation rather than the
+     * physical device orientation. It is wired up, measured, and only then is
+     * a fix written -- the hypothesis is not assumed.
+     */
+    private fun currentDisplayRotation(): Int = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display?.rotation ?: Surface.ROTATION_0
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.rotation
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "display rotation unavailable", e)
+        Surface.ROTATION_0
+    }
+
+    private fun surfaceRotationName(r: Int) = when (r) {
+        Surface.ROTATION_0 -> "ROTATION_0(0deg)"
+        Surface.ROTATION_90 -> "ROTATION_90(90deg)"
+        Surface.ROTATION_180 -> "ROTATION_180(180deg)"
+        Surface.ROTATION_270 -> "ROTATION_270(270deg)"
+        else -> "ROTATION_?($r)"
+    }
+
+    /**
+     * Snap a continuous sensor azimuth to the four Surface rotations.
+     *
+     * NOTE the inversion: when the device is rotated clockwise, the IMAGE must
+     * be rotated counter-clockwise to stay upright, so 90 degrees of device
+     * rotation maps to Surface.ROTATION_270. Getting this backwards is the
+     * classic way to turn a 90-degree error into a 270-degree one, which is
+     * why it is written out explicitly rather than inlined.
+     */
+    private fun surfaceRotationFor(orientationDegrees: Int): Int = when {
+        orientationDegrees >= 315 || orientationDegrees < 45 -> Surface.ROTATION_0
+        orientationDegrees < 135 -> Surface.ROTATION_270
+        orientationDegrees < 225 -> Surface.ROTATION_180
+        else -> Surface.ROTATION_90
+    }
+
+    /** Enabled while streaming; disabled when the camera is released. */
+    private fun startOrientationListener() {
+        if (orientationListener != null) return
+        orientationListener = object : OrientationEventListener(this) {
+            override fun onOrientationChanged(orientation: Int) {
+                // ORIENTATION_UNKNOWN (-1) happens when the device lies flat,
+                // which is exactly how it sat for the first Milestone 3 test.
+                // Keeping the previous value is the only safe response.
+                if (orientation == ORIENTATION_UNKNOWN) return
+                val bucket = surfaceRotationFor(orientation)
+                if (bucket != lastOrientationBucket) {
+                    lastOrientationBucket = bucket
+                    onPhysicalRotationChanged(bucket, orientation)
+                }
+            }
+        }.also { if (it.canDetectOrientation()) it.enable() else Log.w(TAG, "no orientation sensor") }
+    }
+
+    private fun stopOrientationListener() {
+        orientationListener?.disable()
+        orientationListener = null
+        lastOrientationBucket = -1
+    }
+
+    /**
+     * THE FIX. Drive ImageAnalysis.targetRotation from the PHYSICAL device
+     * orientation instead of leaving it at CameraX's default, which is the
+     * display rotation.
+     *
+     * MEASURED ROOT CAUSE (24 Nov 2026, Pixel 7 Pro, Android 16):
+     *
+     *   ROTDIAG rotationDegrees=90 display=ROTATION_0 targetRotation=ROTATION_0
+     *           physicalBucket=ROTATION_0  raw=640x480 outJpeg=480x640
+     *   ORIENTATION physical=303deg -> ROTATION_90 display=ROTATION_0 ...
+     *   ROTDIAG rotationDegrees=90 display=ROTATION_0 targetRotation=ROTATION_0
+     *           physicalBucket=ROTATION_90 raw=640x480 outJpeg=480x640
+     *
+     * The device was physically turned to landscape (bucket 0 -> 90) and
+     * `rotationDegrees` did NOT change, because auto-rotate was locked to
+     * portrait so the display rotation never moved. CameraX was faithfully
+     * rotating the frame to match a portrait DISPLAY while the camera was
+     * physically pointing at the world sideways -- which is how Milestone 3
+     * produced a 480x640 frame whose contents were 90 degrees off.
+     *
+     * Setting targetRotation makes CameraX recompute `rotationDegrees` for us.
+     * We still apply that value exactly ONCE, in pixels, in imageProxyToJpeg.
+     * No independent display-based correction is added anywhere -- doing both
+     * is what produces a 180-degree error.
+     *
+     * setTargetRotation is explicitly supported while the use case is bound;
+     * it affects subsequent frames only, so a frame already in flight may
+     * still carry the previous value. That is harmless at 5 fps.
+     */
+    private fun onPhysicalRotationChanged(surfaceRotation: Int, rawDegrees: Int) {
+        val before = imageAnalysis?.targetRotation ?: -1
+        imageAnalysis?.targetRotation = surfaceRotation
+        Log.i(
+            TAG,
+            "ORIENTATION physical=${rawDegrees}deg -> ${surfaceRotationName(surfaceRotation)} | " +
+                "display=${surfaceRotationName(currentDisplayRotation())} | " +
+                "targetRotation ${surfaceRotationName(before)} -> " +
+                surfaceRotationName(imageAnalysis?.targetRotation ?: -1)
+        )
+    }
+
+    /** Logged only when any value changes, never per frame. */
+    private fun logRotationDiagnostics(image: ImageProxy, outW: Int, outH: Int) {
+        val deg = image.imageInfo.rotationDegrees
+        val disp = currentDisplayRotation()
+        val target = imageAnalysis?.targetRotation ?: -1
+        val sig = "$deg|$disp|$target|${image.width}x${image.height}|${outW}x$outH|$lastOrientationBucket"
+        if (sig == lastRotationSignature) return
+        lastRotationSignature = sig
+        Log.i(
+            TAG,
+            "ROTDIAG rotationDegrees=$deg | display=${surfaceRotationName(disp)} | " +
+                "targetRotation=${surfaceRotationName(target)} | " +
+                "physicalBucket=${surfaceRotationName(lastOrientationBucket)} | " +
+                "raw=${image.width}x${image.height} | outJpeg=${outW}x$outH"
+        )
+    }
+
     // ------------------------------------------------------- JPEG conversion
 
     private fun imageProxyToJpeg(image: ImageProxy): ByteArray? {
@@ -565,7 +710,14 @@ class MainActivity : ComponentActivity() {
         // depth_to_scan geometry assumes an upright image. Rotating here costs
         // a decode/re-encode, which is affordable at ~5 fps.
         val degrees = image.imageInfo.rotationDegrees
-        return if (degrees == 0) jpeg else rotateJpeg(jpeg, degrees)
+        val result = if (degrees == 0) jpeg else rotateJpeg(jpeg, degrees)
+
+        // Measure the ACTUAL delivered geometry rather than inferring it.
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        if (result != null) BitmapFactory.decodeByteArray(result, 0, result.size, opts)
+        logRotationDiagnostics(image, opts.outWidth, opts.outHeight)
+
+        return result
     }
 
     private fun rotateJpeg(jpeg: ByteArray, degrees: Int): ByteArray? {
@@ -610,6 +762,7 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------------- teardown
 
     override fun onDestroy() {
+        stopOrientationListener()
         scanning = false
         reconnectPending = false
         webSocket?.close(1000, "Activity destroyed")
