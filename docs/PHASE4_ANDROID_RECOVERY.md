@@ -967,3 +967,129 @@ the paired RGB/depth pair, the depth PNG and colour-mapped render, the app
 counter capture, and the raw five-minute log. `backend/uploads/` and
 `backend/depth/output/` remain gitignored with zero tracked files, so no
 photographs of the room enter Git.
+
+---
+
+# Phase 4B Milestone 1 — orientation hysteresis at bucket boundaries
+
+**Date:** 25-26 November 2026. **Branch:** `phase-4-android`, baseline `0faf8c9`.
+**Device:** Pixel 7 Pro, Android 16, CameraX 1.5.0.
+
+**ACCEPTED WITH A KNOWN LIMITATION.** Two of the four orientation boundaries
+were physically verified; two were not. This section says which, and does not
+describe the four boundaries as fully validated.
+
+## 37. The defect
+
+Milestone 4's gate suppressed only *repeats*:
+
+```
+if (bucket != lastOrientationBucket) { apply() }
+```
+
+An A->B->A->B alternation passes that test on every sample, so a phone held
+astride a boundary rewrote `targetRotation` continuously. That decides
+`rotationDegrees`, which decides whether the JPEG is 480x640 or 640x480, so
+consecutive frames in one stream could differ in aspect ratio and MiDaS (and
+later `depth_to_scan`) would inherit the flip. Measured on hardware at
+**physical 43-46 degrees**.
+
+## 38. Implementation
+
+`OrientationStabiliser` is a small, deterministic state machine requiring
+**three consecutive agreeing samples** before the accepted orientation
+changes:
+
+- the first valid sample is accepted immediately (otherwise the camera would
+  sit on CameraX's display-derived default, which is the Milestone 3 defect);
+- `ORIENTATION_UNKNOWN` (-1) is discarded and never counted -- it is what the
+  sensor reports with the device lying flat;
+- a sample agreeing with the current orientation cancels any pending
+  candidate, which is precisely what makes an alternation stable;
+- a non-null return means "changed", so a duplicate can never be emitted;
+- the threshold is configurable (`DEFAULT_SAMPLES_TO_CHANGE = 3`).
+
+It counts **samples, not milliseconds**: sample counting is deterministic and
+testable, whereas a wall-clock delay would make the tests timing-dependent.
+
+The class carries no Android imports, so the whole decision is exercised in
+plain JVM tests. The four-bucket mapping was **moved, not rewritten** --
+`MainActivity.surfaceRotationFor` now delegates to it, so the two cannot
+drift -- and a `check()` at camera-bind time asserts the redeclared
+`ROTATION_*` constants still equal `android.view.Surface`'s.
+
+`rotationDegrees` is still applied exactly once, in pixels, where it always
+was. There is exactly one `targetRotation` assignment in the codebase.
+
+## 39. Automated verification
+
+`./gradlew testDebugUnitTest` -> **27 tests, 0 failures, 0 errors**
+(`OrientationStabiliserTest` 20, `YuvConverterTest` 6, `ExampleUnitTest` 1).
+`./gradlew assembleDebug` -> **BUILD SUCCESSFUL, 0 warnings.**
+
+The 20 new tests assert the **sequence of emitted changes** over a stream of
+samples, not per-angle mapping: the defect was a wrong decision over time,
+which per-angle assertions cannot catch. One test reproduces the OLD gate and
+asserts it flips 11 times where the stabiliser emits 1, so the suite cannot
+quietly become vacuous.
+
+## 40. Physical tests that WERE completed
+
+A temporary diagnostic build (logging every valid sample, its bucket, the
+pending candidate and its count) was used to make the state machine
+observable, then **completely removed**; the rebuilt APK is bit-for-bit
+identical to the pre-diagnostic one.
+
+Measured accelerometer sampling period: **200.00 ms** (`dumpsys
+sensorservice`). Note `OrientationEventListener` delivers *on change*, not at
+a fixed rate, so three samples arrive faster than 3 x 200 ms during motion.
+
+| Boundary | Status | Evidence |
+|---|---|---|
+| **45 deg** | **VERIFIED** | crossed 3x, each `1/3 -> 2/3 -> ACCEPTED`, both directions |
+| **315 deg** | **VERIFIED** | crossed 2x, each `1/3 -> 2/3 -> ACCEPTED`, both directions |
+
+Five accepted transitions in total, each preceded by exactly one `1/3` and
+one `2/3` sample. **Settle times: 241, 274, 273, 273, 273 ms** (mean 267 ms,
+max 274 ms) -- comfortably inside the one-second target.
+
+Anti-flapping evidence: a 30-second hold at **316-324 degrees**, 91 samples,
+produced **zero** candidate activity and **zero** accepted transitions. Across
+roughly 700 logged samples the counter reached `1/3` five times and `2/3`
+five times -- once per genuine crossing, never otherwise.
+
+No streaming regression: direct Wi-Fi throughout (backend peer was the
+phone's LAN address, never loopback), 4.62 fps against the unchanged 5.0
+limit, `adb reverse`/`forward` empty before, during and after. RGB and depth
+agreed exactly (480x640 both, finite, 256 distinct values). Inspected frames
+were upright with natural colours and no shearing.
+
+## 41. Physical tests NOT completed -- the accepted limitation
+
+1. **The 135 deg and 225 deg boundaries remain PHYSICALLY UNVERIFIED.** Both
+   require passing through upside-down; the `ROTATION_180` bucket was never
+   entered in any test window. They are covered by unit tests only, which is
+   weaker evidence and is not treated as equivalent.
+2. **Sustained diagonal-boundary jitter testing was not completed.** The
+   verified crossings were observed *in transit* during deliberate rotations.
+   The closest sustained evidence is the 316-324 degree hold, which sits
+   beside the 315 boundary without straddling it. No window captured a phone
+   held steady *on* a boundary with the reading oscillating across it.
+3. **No JPEG was inspected while the phone was held at a true diagonal.** The
+   four "hold" captures measured only 2.0-3.5 degrees off-cardinal, which
+   proves the phone was cardinal, not diagonal.
+
+**This milestone is accepted with those limitations.** The hysteresis is
+proven correct in simulation for all four boundaries and on hardware for two
+of them.
+
+## 42. Other limitations carried forward
+
+- A frame already in flight when the orientation changes still carries the
+  previous rotation -- unchanged by this work, harmless at 5 fps.
+- One unexplained `websocket failure: timeout` during testing, auto-recovered
+  in ~2 s by the existing reconnect path.
+- Settle time varies with rotation speed, because the listener is
+  change-driven; 267 ms was measured during deliberate turns.
+- Screen-sleep still stops streaming, and there is still no UDP discovery
+  client. Both remain open by design.

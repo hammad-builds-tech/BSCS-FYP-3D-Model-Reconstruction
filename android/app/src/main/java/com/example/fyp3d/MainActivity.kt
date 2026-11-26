@@ -168,6 +168,13 @@ class MainActivity : ComponentActivity() {
     private var imageAnalysis: ImageAnalysis? = null
     private var orientationListener: OrientationEventListener? = null
 
+    /**
+     * Phase 4B: debounces orientation samples so boundary noise cannot flip
+     * targetRotation. Only ever touched from the main thread, which is where
+     * OrientationEventListener delivers its callbacks.
+     */
+    private val orientationStabiliser = OrientationStabiliser()
+
     /** Last physical-orientation bucket reported by the sensor, in degrees. */
     @Volatile
     private var lastOrientationBucket = -1
@@ -595,27 +602,40 @@ class MainActivity : ComponentActivity() {
      * classic way to turn a 90-degree error into a 270-degree one, which is
      * why it is written out explicitly rather than inlined.
      */
-    private fun surfaceRotationFor(orientationDegrees: Int): Int = when {
-        orientationDegrees >= 315 || orientationDegrees < 45 -> Surface.ROTATION_0
-        orientationDegrees < 135 -> Surface.ROTATION_270
-        orientationDegrees < 225 -> Surface.ROTATION_180
-        else -> Surface.ROTATION_90
-    }
+    /**
+     * The mapping now lives in [OrientationStabiliser] so that it and the
+     * debouncing around it are covered by the same JVM tests. The values are
+     * unchanged from the version verified on hardware in Milestone 4; this is
+     * a delegation, not a re-definition, so the two cannot drift apart.
+     */
+    private fun surfaceRotationFor(orientationDegrees: Int): Int =
+        OrientationStabiliser.bucketFor(orientationDegrees)
 
     /** Enabled while streaming; disabled when the camera is released. */
     private fun startOrientationListener() {
         if (orientationListener != null) return
+        // OrientationStabiliser redeclares the Surface constants to stay free
+        // of Android imports. If they ever drift apart every rotation breaks
+        // silently, so assert the equivalence once, loudly, at bind time.
+        check(
+            OrientationStabiliser.ROTATION_0 == Surface.ROTATION_0 &&
+                OrientationStabiliser.ROTATION_90 == Surface.ROTATION_90 &&
+                OrientationStabiliser.ROTATION_180 == Surface.ROTATION_180 &&
+                OrientationStabiliser.ROTATION_270 == Surface.ROTATION_270
+        ) { "OrientationStabiliser rotation constants no longer match Surface" }
         orientationListener = object : OrientationEventListener(this) {
             override fun onOrientationChanged(orientation: Int) {
-                // ORIENTATION_UNKNOWN (-1) happens when the device lies flat,
-                // which is exactly how it sat for the first Milestone 3 test.
-                // Keeping the previous value is the only safe response.
-                if (orientation == ORIENTATION_UNKNOWN) return
-                val bucket = surfaceRotationFor(orientation)
-                if (bucket != lastOrientationBucket) {
-                    lastOrientationBucket = bucket
-                    onPhysicalRotationChanged(bucket, orientation)
-                }
+                // The stabiliser owns the whole decision, including
+                // ORIENTATION_UNKNOWN (-1), which it maps to "no opinion" --
+                // that is what the sensor reports with the device lying flat,
+                // exactly how it sat at the start of the Milestone 3 test.
+                //
+                // It returns non-null ONLY when the orientation genuinely
+                // changes, so this can never apply a duplicate, and an A/B
+                // alternation at a bucket boundary produces nothing at all.
+                val accepted = orientationStabiliser.onSample(orientation) ?: return
+                lastOrientationBucket = accepted
+                onPhysicalRotationChanged(accepted, orientation)
             }
         }.also { if (it.canDetectOrientation()) it.enable() else Log.w(TAG, "no orientation sensor") }
     }
@@ -624,6 +644,10 @@ class MainActivity : ComponentActivity() {
         orientationListener?.disable()
         orientationListener = null
         lastOrientationBucket = -1
+        // Clear the debounce state too, so a later bind starts fresh and
+        // accepts its first valid sample immediately rather than inheriting a
+        // stale candidate from the previous session.
+        orientationStabiliser.reset()
     }
 
     /**
