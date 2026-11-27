@@ -11,6 +11,7 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.hardware.camera2.CameraCharacteristics
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -29,6 +30,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -42,6 +44,8 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -174,6 +178,23 @@ class MainActivity : ComponentActivity() {
      * OrientationEventListener delivers its callbacks.
      */
     private val orientationStabiliser = OrientationStabiliser()
+
+    /**
+     * Phase 4B M2: intrinsics as the DEVICE reports them, at active sensor
+     * array resolution. Scaled and rotated per frame so the transmitted matrix
+     * describes the image the backend actually decodes. Null until the camera
+     * binds, and left null if the device exposes nothing usable -- in which
+     * case no intrinsics are sent rather than invented ones.
+     */
+    @Volatile
+    private var baseIntrinsics: CameraIntrinsics? = null
+
+    /**
+     * Monotonic per-frame sequence number. The backend's own `frame_count` is
+     * incremented on ARRIVAL, so it cannot identify which capture produced a
+     * given depth map; this can. Written only from the analyzer thread.
+     */
+    private val frameSeq = AtomicInteger(0)
 
     /** Last physical-orientation bucket reported by the sensor, in degrees. */
     @Volatile
@@ -508,13 +529,14 @@ class MainActivity : ComponentActivity() {
                 }
 
                 provider.unbindAll()
-                provider.bindToLifecycle(
+                val camera = provider.bindToLifecycle(
                     this,
                     CameraSelector.DEFAULT_BACK_CAMERA,
                     preview,
                     analysis
                 )
                 Log.i(TAG, "camera bound")
+                readCameraIntrinsics(camera)
                 startOrientationListener()
             } catch (e: Exception) {
                 Log.e(TAG, "camera bind failed", e)
@@ -547,7 +569,39 @@ class MainActivity : ComponentActivity() {
                 return
             }
 
+            val rawW = imageProxy.width
+            val rawH = imageProxy.height
+            val rotation = imageProxy.imageInfo.rotationDegrees
+            val tsNs = imageProxy.imageInfo.timestamp
+
             val jpeg = imageProxyToJpeg(imageProxy) ?: return
+
+            // Decode only the header to learn the DELIVERED geometry, so the
+            // metadata describes the exact bytes being sent rather than an
+            // assumption about what rotation did.
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
+
+            val seq = frameSeq.incrementAndGet()
+            val meta = frameMetadata(
+                seq = seq, tsNs = tsNs,
+                rawW = rawW, rawH = rawH,
+                rotationDegrees = rotation,
+                outW = opts.outWidth, outH = opts.outHeight,
+            )
+
+            // ORDER MATTERS: text first, then the binary frame it describes.
+            // WebSocket preserves message order per connection and both are
+            // written from this single analyzer thread, so the backend can
+            // bind the metadata to the very next binary message. If the text
+            // fails to enqueue, skip the frame rather than send an unlabelled
+            // one -- a frame whose metadata belongs to a different capture is
+            // worse than no frame.
+            if (!socket.send(meta)) {
+                framesDropped.incrementAndGet()
+                refreshCounts()
+                return
+            }
 
             if (socket.send(ByteString.of(*jpeg))) {
                 lastSentAtMs.set(now)
@@ -706,6 +760,120 @@ class MainActivity : ComponentActivity() {
                 "physicalBucket=${surfaceRotationName(lastOrientationBucket)} | " +
                 "raw=${image.width}x${image.height} | outJpeg=${outW}x$outH"
         )
+    }
+
+    // --------------------------------------------- camera intrinsics (M2)
+
+    /**
+     * Read the REAL intrinsics from the bound camera. Nothing here is
+     * fabricated: if the device exposes neither a calibrated matrix nor a
+     * focal length and physical sensor size, [baseIntrinsics] stays null and
+     * the frame metadata simply carries no intrinsics plus
+     * `intrinsics_source: "unavailable"`.
+     *
+     * LENS_INTRINSIC_CALIBRATION and LENS_DISTORTION are OPTIONAL in the
+     * Camera2 specification, so the fallback is not hypothetical.
+     *
+     * Values are reported in ACTIVE SENSOR ARRAY pixels; the per-frame scaling
+     * to the analysis resolution happens in [frameMetadata].
+     */
+    private fun readCameraIntrinsics(camera: androidx.camera.core.Camera) {
+        try {
+            val info = Camera2CameraInfo.from(camera.cameraInfo)
+            val active = info.getCameraCharacteristic(
+                CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE
+            )
+            val aw = active?.width() ?: 0
+            val ah = active?.height() ?: 0
+
+            val cal = info.getCameraCharacteristic(
+                CameraCharacteristics.LENS_INTRINSIC_CALIBRATION
+            )
+            val dist = info.getCameraCharacteristic(
+                CameraCharacteristics.LENS_DISTORTION
+            )?.map { it.toDouble() }
+
+            if (cal != null && cal.size >= 4 && aw > 0 && ah > 0) {
+                // [fx, fy, cx, cy, skew] in active-array pixels.
+                baseIntrinsics = CameraIntrinsics(
+                    fx = cal[0].toDouble(), fy = cal[1].toDouble(),
+                    cx = cal[2].toDouble(), cy = cal[3].toDouble(),
+                    distortion = dist,
+                    source = CameraIntrinsics.SOURCE_CALIBRATED,
+                    width = aw, height = ah,
+                )
+                Log.i(TAG, "intrinsics CALIBRATED ${baseIntrinsics}")
+                return
+            }
+
+            val focal = info.getCameraCharacteristic(
+                CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS
+            )?.firstOrNull()?.toDouble()
+            val phys = info.getCameraCharacteristic(
+                CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE
+            )
+            if (focal != null && phys != null && aw > 0 && ah > 0) {
+                baseIntrinsics = CameraIntrinsics.fromFocalLength(
+                    focalLengthMm = focal,
+                    sensorWidthMm = phys.width.toDouble(),
+                    sensorHeightMm = phys.height.toDouble(),
+                    width = aw, height = ah,
+                )?.copy(distortion = dist)
+                Log.i(TAG, "intrinsics DERIVED (f=${focal}mm sensor=${phys.width}x${phys.height}mm) ${baseIntrinsics}")
+                return
+            }
+
+            Log.w(TAG, "intrinsics UNAVAILABLE: device exposed neither a " +
+                "calibrated matrix nor focal length + physical sensor size")
+        } catch (e: Exception) {
+            Log.w(TAG, "intrinsics query failed; reporting unavailable", e)
+            baseIntrinsics = null
+        }
+    }
+
+    /**
+     * Per-frame metadata, sent as ONE JSON text message immediately before the
+     * binary JPEG it describes.
+     *
+     * Pairing is positional and relies on WebSocket message ordering, which is
+     * guaranteed per connection: both messages are written from the single
+     * analyzer thread, text first, so the backend can attach the metadata to
+     * the very next binary frame. The JPEG itself stays RAW with no envelope,
+     * so the existing contract is untouched.
+     *
+     * `w`/`h` and the intrinsics describe the image AFTER rotation, i.e.
+     * exactly what the backend decodes.
+     */
+    private fun frameMetadata(
+        seq: Int,
+        tsNs: Long,
+        rawW: Int,
+        rawH: Int,
+        rotationDegrees: Int,
+        outW: Int,
+        outH: Int,
+    ): String {
+        val o = JSONObject()
+        o.put("seq", seq)
+        o.put("ts_ns", tsNs)
+        o.put("w", outW)
+        o.put("h", outH)
+        o.put("raw_w", rawW)
+        o.put("raw_h", rawH)
+        o.put("rotation_deg", rotationDegrees)
+
+        val base = baseIntrinsics
+        if (base != null && rawW > 0 && rawH > 0) {
+            // sensor array -> analysis resolution -> delivered (rotated) image
+            val k = base.scaledTo(rawW, rawH).rotatedBy(rotationDegrees)
+            o.put("fx", k.fx); o.put("fy", k.fy)
+            o.put("cx", k.cx); o.put("cy", k.cy)
+            o.put("intrinsics_source", k.source)
+            k.distortion?.let { d -> o.put("distortion", JSONArray(d)) }
+        } else {
+            o.put("intrinsics_source", CameraIntrinsics.SOURCE_UNAVAILABLE)
+        }
+        return o.toString()
     }
 
     // ------------------------------------------------------- JPEG conversion

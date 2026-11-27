@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 from pathlib import Path
 import asyncio
+import io
+import json
 import os
 import socket
 import threading
@@ -34,6 +36,18 @@ frame_count = 0
 pending_frame: Optional[np.ndarray] = None
 processing_lock = threading.Lock()
 inference_active = False
+
+# --- Phase 4B M2: per-frame metadata ----------------------------------
+# The phone sends ONE JSON text message immediately before each binary JPEG.
+# WebSocket preserves message order per connection, so the text describes the
+# very next binary frame. The JPEG itself is still raw bytes with no envelope,
+# so a client that sends binary only keeps working exactly as before.
+latest_meta: Optional[dict] = None        # metadata of the most recent frame
+depth_meta: Optional[dict] = None         # metadata of the frame `latest_depth` came from
+# Raw float32 depth of the most recent inference, as model output -- NOT
+# normalised. `latest_depth` is the same array; this name is kept separate so
+# the float endpoint cannot be confused with the 8-bit PNG path.
+latest_depth_npy: Optional[bytes] = None
 
 # Hard offline switch: when True, ALL new video websocket connections are
 # rejected with policy code 1008. Used to enforce the 30-second capture
@@ -105,24 +119,40 @@ print("MiDaS ready.")
 
 def inference_worker():
     """Background thread that processes frames from the buffer."""
-    global latest_depth, pending_frame, inference_active
-    
+    global latest_depth, pending_frame, inference_active, depth_meta, latest_depth_npy
+
     while True:
         frame_to_process = None
-        
+        meta_for_frame = None
+
         with processing_lock:
             if pending_frame is not None:
                 frame_to_process = pending_frame
+                # Capture the metadata of THIS frame together with the pixels,
+                # under the same lock. Reading it afterwards would race with
+                # the socket thread and could attribute a depth map to a
+                # different capture -- exactly what the seq number exists to
+                # make checkable.
+                meta_for_frame = latest_meta
                 pending_frame = None
                 inference_active = True
-        
+
         if frame_to_process is not None:
             # Run MiDaS inference (blocks this background thread only)
             depth = midas.predict(frame_to_process)
-            
+
+            # Serialise OUTSIDE the lock (np.save of ~1.2 MB takes a few ms),
+            # then publish the array, its .npy bytes and its metadata in ONE
+            # locked assignment. Previously the .npy was written after the
+            # lock was released, so for that window /latest-depth-raw could
+            # return the new frame's seq with the previous frame's depth.
+            depth_npy = _encode_depth_float(depth)
+
             # Save latest depth
             with processing_lock:
                 latest_depth = depth
+                depth_meta = meta_for_frame
+                latest_depth_npy = depth_npy
                 inference_active = False
 
             # Persist normalized PNG for /latest-depth-image consumers
@@ -131,6 +161,24 @@ def inference_worker():
         else:
             # No frame to process, sleep briefly
             threading.Event().wait(0.05)
+
+
+def _encode_depth_float(depth: np.ndarray) -> bytes:
+    """Keep the RAW float32 depth so it can be served unmodified.
+
+    The existing PNG path applies cv2.NORM_MINMAX PER FRAME, which rescales
+    every frame independently: the same physical distance becomes a different
+    number as the scene's min/max move, and the result is quantised to 256
+    levels. That is fine for a human preview and useless for geometry, so the
+    float array is preserved here instead of being discarded.
+
+    This is additive. /latest-depth-image and its 8-bit PNG are untouched.
+    """
+    buf = io.BytesIO()
+    # .npy keeps dtype and shape, so the consumer needs no out-of-band
+    # agreement about either.
+    np.save(buf, depth.astype(np.float32), allow_pickle=False)
+    return buf.getvalue()
 
 
 def _write_depth_png(depth: np.ndarray) -> None:
@@ -201,6 +249,12 @@ def health():
         "inference_active": active,
         "discovery_port": DISCOVERY_PORT,
         "video_stream_locked": video_stream_locked,
+        # Phase 4B M2
+        "frame_metadata": latest_meta is not None,
+        "intrinsics_source": (latest_meta or {}).get("intrinsics_source"),
+        "latest_seq": (latest_meta or {}).get("seq"),
+        "depth_seq": (depth_meta or {}).get("seq"),
+        "depth_raw_available": latest_depth_npy is not None,
     }
 
 
@@ -214,6 +268,7 @@ async def video_websocket(websocket: WebSocket):
     global latest_frame
     global frame_count
     global pending_frame
+    global latest_meta
 
     if video_stream_locked:
         await websocket.accept()
@@ -225,11 +280,46 @@ async def video_websocket(websocket: WebSocket):
 
     print("PHONE CONNECTED")
 
+    # Metadata awaiting its JPEG. Deliberately a LOCAL of this connection:
+    # it was module-global in the first M2 cut, so metadata left dangling by
+    # one client (sent, then disconnected before its JPEG) labelled the first
+    # frame of the NEXT, unrelated connection. Scoping it here makes that
+    # impossible by construction.
+    pending_meta: Optional[dict] = None
+
     try:
 
         while True:
 
-            data = await websocket.receive_bytes()
+            message = await websocket.receive()
+
+            # Phase 4B M2: the phone may precede each binary JPEG with ONE
+            # JSON text message carrying seq, capture timestamp and the real
+            # camera intrinsics for that exact frame.
+            #
+            # Backward compatible BY DESIGN: a client that sends only binary
+            # frames (every version before M2, and scripts/test_backend_
+            # pipeline.py) still works -- the metadata simply stays None.
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+
+            text = message.get("text")
+            if text is not None:
+                try:
+                    meta = json.loads(text)
+                    if isinstance(meta, dict):
+                        pending_meta = meta
+                    else:
+                        print(f"frame metadata ignored (not an object): {text[:120]}")
+                except (ValueError, TypeError) as exc:
+                    # Never drop the connection over bad metadata: the frames
+                    # themselves are still useful, just unlabelled.
+                    print(f"frame metadata unparseable, ignoring: {exc}")
+                continue
+
+            data = message.get("bytes")
+            if data is None:
+                continue
 
             # JPEG bytes → OpenCV image
             image_array = np.frombuffer(
@@ -244,6 +334,11 @@ async def video_websocket(websocket: WebSocket):
 
             if frame is None:
 
+                # The metadata described THIS (bad) frame. Discard it now;
+                # otherwise it stays pending and labels the next valid frame,
+                # which is a different capture.
+                pending_meta = None
+
                 await websocket.send_json({
                     "status": "error",
                     "message": "Invalid JPEG frame"
@@ -252,6 +347,13 @@ async def video_websocket(websocket: WebSocket):
                 continue
 
             frame_count += 1
+
+            # Bind the metadata that arrived immediately before these bytes.
+            # Consumed exactly once, so a frame can never inherit a previous
+            # frame's label if the phone stops sending metadata mid-stream.
+            frame_meta = pending_meta
+            pending_meta = None
+            latest_meta = frame_meta
 
             latest_frame = frame
 
@@ -289,6 +391,8 @@ async def video_websocket(websocket: WebSocket):
 
                 "status": "ok",
 
+                "seq": (frame_meta or {}).get("seq"),
+
                 "frame": frame_count,
 
                 "width": frame.shape[1],
@@ -304,6 +408,75 @@ async def video_websocket(websocket: WebSocket):
     except WebSocketDisconnect:
 
         print("PHONE DISCONNECTED")
+
+
+# =========================
+# RAW FLOAT DEPTH + FRAME METADATA  (Phase 4B M2)
+# =========================
+
+@app.get("/latest-depth-raw")
+def get_latest_depth_raw():
+    """Raw float32 MiDaS output as a .npy payload, with its source frame.
+
+    This is the endpoint 3D reconstruction should use. /latest-depth-image
+    remains the 8-bit preview and is unchanged, but it is per-frame
+    NORM_MINMAX normalised, so its values are not comparable between frames.
+
+    The `X-Frame-Seq` header names the phone-side sequence number of the RGB
+    frame this depth was computed from, so a consumer can prove the pairing
+    instead of assuming it. It is absent when the client sent no metadata.
+
+    Values are MiDaS inverse RELATIVE depth -- larger means nearer, and there
+    is NO metric scale. Nothing here converts it to metres.
+    """
+    with processing_lock:
+        payload = latest_depth_npy
+        meta = depth_meta
+
+    if payload is None:
+        return JSONResponse(
+            status_code=404,
+            content={"message": "No depth generated yet"},
+        )
+
+    headers = {"X-Depth-Units": "midas-inverse-relative-unscaled"}
+    if meta is not None and meta.get("seq") is not None:
+        headers["X-Frame-Seq"] = str(meta["seq"])
+    if meta is not None and meta.get("ts_ns") is not None:
+        headers["X-Frame-Timestamp-Ns"] = str(meta["ts_ns"])
+
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers=headers,
+    )
+
+
+@app.get("/latest-frame-meta")
+def get_latest_frame_meta():
+    """Metadata of the most recent RGB frame, and of the frame behind the depth.
+
+    `depth_frame` is what matters for reconstruction: it is the metadata of
+    the capture `latest_depth` was actually computed from. Because inference
+    is latest-frame-wins and slower than the uplink, it routinely lags
+    `latest_frame` by several frames -- comparing the two seq numbers shows
+    by how much, rather than leaving it to be assumed.
+    """
+    with processing_lock:
+        latest = latest_meta
+        d_meta = depth_meta
+
+    return {
+        "status": "ok",
+        "latest_frame": latest,
+        "depth_frame": d_meta,
+        "seq_lag": (
+            (latest or {}).get("seq", 0) - (d_meta or {}).get("seq", 0)
+            if latest and d_meta
+            and latest.get("seq") is not None and d_meta.get("seq") is not None
+            else None
+        ),
+    }
 
 
 # =========================

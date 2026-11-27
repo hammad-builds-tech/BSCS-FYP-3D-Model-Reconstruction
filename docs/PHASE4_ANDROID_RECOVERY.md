@@ -1093,3 +1093,260 @@ of them.
   change-driven; 267 ms was measured during deliberate turns.
 - Screen-sleep still stops streaming, and there is still no UDP discovery
   client. Both remain open by design.
+
+---
+
+# Phase 4B Milestone 2 — camera metadata and float32 depth
+
+**Date:** 26-27 November 2026. **Branch:** `phase-4-android`, baseline `bf86c9e`.
+**Device:** Pixel 7 Pro, Android 16, CameraX 1.5.0. **Status:** implemented,
+physically tested, awaiting acceptance review.
+
+The Phase 4B audit found that the live phone path back-projected depth through
+**fabricated** intrinsics (`fx = fy = 500`, `cx = 40`, `cy = 30` in
+`depth_to_pointcloud.py`), discarded the float depth at the HTTP boundary, and
+had no way to tell which RGB frame a depth map came from. This milestone fixes
+the first and third and makes the second available. The full wire contract is
+in [`API.md`](API.md); this section records provenance, verification and
+limitations.
+
+## 43. What changed
+
+| File | Change |
+|---|---|
+| `android/.../CameraIntrinsics.kt` | **new** -- pure-Kotlin intrinsics with scaling, rotation and provenance |
+| `android/.../CameraIntrinsicsTest.kt` | **new** -- 17 JVM tests |
+| `android/.../MainActivity.kt` | reads real Camera2 characteristics; sends one metadata message before each JPEG |
+| `backend/api/main.py` | accepts metadata; keeps float32 depth; two new endpoints; three association fixes (section 47); +179 / -6 lines |
+
+Four of the six deleted backend lines are whitespace-only. The other two are
+the `global` declaration of the inference worker (extended) and
+`receive_bytes()` (replaced by a dispatching `receive()`).
+
+**The existing protocol was extended, not versioned.** There is no
+`/ws/video/v2`. `/ws/video` now also accepts an optional JSON text message
+before each binary JPEG, and a client that sends binary only behaves exactly
+as before.
+
+Unchanged: `/latest-depth-image` (its PNG writer is byte-identical to
+baseline), the depth algorithm, ROS 2, Nav2, and Phases 1-3.
+
+## 44. Camera calibration -- genuine hardware values
+
+### 44.1 Source
+
+The Pixel 7 Pro populates `LENS_INTRINSIC_CALIBRATION`, which the Camera2
+specification makes **optional**. These are therefore genuine device
+calibration values. The app logged, at camera bind:
+
+```
+intrinsics CALIBRATED  source=LENS_INTRINSIC_CALIBRATION
+```
+
+The `FOCAL_LENGTH+SENSOR_SIZE` fallback and the `unavailable` path exist in the
+code but **were not exercised on this device** -- every number below is
+hardware calibration, none is a fallback estimate.
+
+### 44.2 Original values, in active-array pixels
+
+| | Value |
+|---|---|
+| Reference array (`SENSOR_INFO_ACTIVE_ARRAY_SIZE`) | **4080 x 3072** |
+| `fx` | 2798.407470703125 |
+| `fy` | 2798.407470703125 |
+| `cx` | 2027.28955078125 |
+| `cy` | 1548.5643310546875 |
+| `LENS_DISTORTION` | `[0.12367305159568787, -0.18618865311145782, 0.11130569875240326, 0.0, 0.0]` |
+
+`cx` sits about 12 px off the geometric centre (2039.5); a fabricated matrix
+would typically be exactly centred. `fx == fy` exactly, i.e. square pixels.
+
+The distortion array is in Camera2's order **`[k1, k2, k3, p1, p2]`** (three
+radial, two tangential). Here both tangential terms are zero.
+
+### 44.3 Resolution scaling
+
+The transmitted frames come from ImageAnalysis at 640 x 480, not the 4080 x 3072
+array. `CameraIntrinsics.scaledTo()` applies **independent** factors:
+
+```
+sx = 640 / 4080 = 0.156863        sy = 480 / 3072 = 0.156250
+```
+
+Forwarding the array-pixel matrix unscaled would overstate `fx` by about 6.4x;
+the transmitted value is 6.4x smaller, confirming the scaling is applied.
+
+### 44.4 Crop handling -- NOT implemented
+
+The active array (4080 / 3072 = 1.3281) and the analysis stream
+(640 / 480 = 1.3333) differ in aspect ratio by **0.39%**, so CameraX must crop
+the sensor slightly to produce 4:3. **The code does not model that crop.** It
+scales each axis independently instead of applying one uniform scale plus a
+crop offset, and it does not read `SCALER_CROP_REGION` or any capture-result
+crop.
+
+The evidence that this matters is internal to the data: the sensor reports
+square pixels (`fx == fy`), yet the transmitted matrix has
+`fx / fy = 0.99609` -- **exactly** the aspect mismatch. That non-squareness is
+an artefact of independent scaling, not a property of the camera.
+
+If the actual crop is the obvious one -- full width kept, height centre-cropped
+from 3072 to 3060 rows -- the transmitted values compare as follows:
+
+| | transmitted | centred-crop model | difference |
+|---|---|---|---|
+| `fx` | 437.2512 | 438.9659 | **-1.71 px (-0.39%)** |
+| `fy` | 438.9659 | 438.9659 | 0 |
+| `cx` | 237.0368 | 237.0291 | +0.008 px |
+| `cy` | 318.0062 | 318.0062 | 0 |
+
+This crop geometry is **inferred, not measured**: the real crop region was not
+read from the device. The error is small, but it is systematic.
+
+### 44.5 Rotation
+
+The JPEG is rotated by `imageInfo.rotationDegrees` before transmission, so the
+matrix is rotated to match. For 90 degrees, axes swap:
+
+```
+fx' = fy     fy' = fx     cx' = (H - 1) - cy     cy' = cx     (W', H') = (H, W)
+```
+
+180 and 270 are handled likewise and covered by tests. Pixel convention is
+`u` right, `v` down, origin at the top-left of the delivered image.
+
+### 44.6 Final transmitted calibration -- upright portrait, 480 x 640
+
+| | Value |
+|---|---|
+| `w x h` | 480 x 640 |
+| `fx` | 437.2511672973633 |
+| `fy` | 438.9658777573529 |
+| `cx` | 237.03682327270508 |
+| `cy` | 318.0062040441176 |
+| `distortion` | passed through unchanged |
+| `intrinsics_source` | `LENS_INTRINSIC_CALIBRATION` |
+
+All four values matched an independent hand computation to better than
+1e-6 px on the physical device.
+
+### 44.7 Provenance limitations
+
+1. **Crop not modelled** (44.4) -- `fx` is likely 0.39% low.
+2. **Reference array assumed.** The code scales from
+   `SENSOR_INFO_ACTIVE_ARRAY_SIZE`. It does not read
+   `SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE` or the distortion-correction
+   mode, so if the calibration is expressed relative to a different array on
+   this device, the offset is not accounted for. Not verified either way.
+3. **Distortion is not rotated.** Radial terms are rotation-invariant, but
+   tangential terms change under a 90-degree rotation. They are zero on this
+   device, so there is no numeric effect here -- on a device with non-zero
+   `p1`/`p2` the transmitted values would be wrong for rotated frames.
+4. **Distortion is applied nowhere.** It is transmitted only.
+5. **Order differs from OpenCV.** Camera2 gives `[k1, k2, k3, p1, p2]`;
+   OpenCV expects `[k1, k2, p1, p2, k3]`.
+6. **The fallback picks the first listed focal length**
+   (`LENS_INFO_AVAILABLE_FOCAL_LENGTHS.firstOrNull()`). Not exercised here,
+   but on a multi-focal camera that need not be the active one.
+
+## 45. Float32 depth preservation
+
+`GET /latest-depth-raw` serves the unmodified model output as a NumPy `.npy`
+payload: **float32**, shape `(height, width)` of the delivered frame,
+C / row-major. Headers name the source frame (`X-Frame-Seq`,
+`X-Frame-Timestamp-Ns`) and the units (`X-Depth-Units:
+midas-inverse-relative-unscaled`).
+
+**The values are MiDaS relative inverse depth, not metric distance.** Larger
+means nearer; the scale is arbitrary and may differ between frames. Real
+intrinsics make a back-projected cloud correctly *shaped*, but its scale
+remains unknown. Metric calibration was explicitly out of scope.
+
+On the physical device the float array carried **305,774** distinct values,
+against **256** in the 8-bit preview.
+
+`/latest-depth-image` is unchanged and remains for visualisation and for the
+ROS depth bridge. Its PNG is per-frame `NORM_MINMAX`, which is why it cannot
+be used for geometry; the regression confirmed it is byte-for-byte that
+normalisation of the float array from the same frame (max absolute
+difference 0).
+
+**No backend inference timestamp is recorded.** The only timestamp is the
+phone's capture `ts_ns` -- a device-local monotonic counter whose timebase is
+not transmitted. Capture-to-depth latency is not measurable from current
+outputs; only the frame lag is (`seq_lag` in `/latest-frame-meta`, observed
+at 0-2 frames, because inference is latest-frame-wins).
+
+## 46. Test results -- reconciled
+
+The M2 physical-test report stated **61** passing tests while enumerating
+suites that sum to 44. **The 61 was an arithmetic error in that report**;
+there are no further suites. It appeared only in the chat report and in no
+committed document. Fresh run, results directory cleared first:
+
+```
+cd android && ./gradlew testDebugUnitTest --rerun-tasks
+```
+
+| Suite | Tests | Failures | Errors | Skipped |
+|---|---|---|---|---|
+| `CameraIntrinsicsTest` | 17 | 0 | 0 | 0 |
+| `OrientationStabiliserTest` | 20 | 0 | 0 | 0 |
+| `YuvConverterTest` | 6 | 0 | 0 | 0 |
+| `ExampleUnitTest` | 1 | 0 | 0 | 0 |
+| **Total** | **44** | **0** | **0** | **0** |
+
+Other test assets in the repository, and why they are not in that total:
+
+| Asset | Status |
+|---|---|
+| `androidTest/ExampleInstrumentedTest.kt` | 1 instrumented test; needs a device; not run in M2 |
+| Backend pytest | none exist |
+| `scripts/test_backend_pipeline.py` | legacy smoke client; needs a `video_frames/` directory that is absent, so it cannot run as-is |
+| ROS 2 colcon tests | 17 files; untouched by M2; not re-run |
+
+`./gradlew assembleDebug`: BUILD SUCCESSFUL, 0 warnings. The rebuilt APK is
+bit-identical (`17425475...`) to the one physically tested.
+
+### Integration regression (ad-hoc, not a test suite)
+
+A scripted WebSocket client exercised the backend against frozen state:
+**26 of 26 checks passed** -- legacy binary-only frames, metadata pairing and
+`seq` echo, `X-Frame-Seq`/`ts_ns` consistency, float32 dtype/shape/order/
+finiteness, min/max agreement with `/latest-depth`, preview unchanged, and
+survival of malformed metadata.
+
+## 47. Defects found during closeout -- fixed before commit
+
+Closeout testing found three metadata-association defects. The 26/26
+regression had passed while all three were present, because it did not
+exercise these paths. All three were fixed in `backend/api/main.py` before
+M2 was committed.
+
+| # | Defect | Fix | Verification |
+|---|---|---|---|
+| 1 | An undecodable JPEG left its metadata pending; it attached to the next valid frame | invalid-JPEG branch discards the metadata | **Reproduced, then fixed:** `seq 7001` leak -> `seq null` |
+| 2 | Pending metadata was a module global and survived across connections | now a local of each connection | **Reproduced, then fixed:** client A's `seq 8001` on client B's frame -> `seq null` |
+| 3 | Depth `.npy` was published just after the lock that published its metadata | serialised outside the lock, assigned with `depth_meta` inside it | **Structural only:** never reproduced (0/739 before, 0/616 after) |
+
+After the fixes the full regression still passes 26/26.
+
+The M2 physical-test report had claimed that a frame "can never inherit a
+previous frame's label". Defects 1 and 2 showed that claim was false when it
+was made; with the fixes it now holds for the paths tested here.
+
+A related caveat, **not** fixed because it is app-side and outside this scope:
+`seq` is scoped to one `MainActivity` instance and restarts at 1 whenever the
+activity is recreated, because the manifest declares no `configChanges`. It is
+not a globally unique frame ID; `(seq, ts_ns)` is.
+
+## 48. Remaining limitations
+
+1. Depth is **relative, not metric**. No calibration against known distances.
+2. Crop not modelled; `fx` likely 0.39% low (44.4).
+3. ROS 2 still consumes the 8-bit preview; nothing downstream uses the
+   intrinsics or the float depth yet.
+4. Distortion transmitted but not applied, and not rotated.
+5. No camera pose -- frames still cannot be fused into one coordinate system.
+6. Capture timebase not transmitted; no backend inference timestamp.
+7. `seq` restarts when the activity is recreated (section 47).
