@@ -238,6 +238,11 @@ def health():
     with processing_lock:
         active = inference_active
         depth = latest_depth
+        # Snapshot the M2 fields in the same critical section so latest_seq
+        # and depth_seq describe one consistent instant.
+        meta = latest_meta
+        d_meta = depth_meta
+        raw_available = latest_depth_npy is not None
 
     return {
         "status": "ok",
@@ -250,11 +255,11 @@ def health():
         "discovery_port": DISCOVERY_PORT,
         "video_stream_locked": video_stream_locked,
         # Phase 4B M2
-        "frame_metadata": latest_meta is not None,
-        "intrinsics_source": (latest_meta or {}).get("intrinsics_source"),
-        "latest_seq": (latest_meta or {}).get("seq"),
-        "depth_seq": (depth_meta or {}).get("seq"),
-        "depth_raw_available": latest_depth_npy is not None,
+        "frame_metadata": meta is not None,
+        "intrinsics_source": (meta or {}).get("intrinsics_source"),
+        "latest_seq": (meta or {}).get("seq"),
+        "depth_seq": (d_meta or {}).get("seq"),
+        "depth_raw_available": raw_available,
     }
 
 
@@ -353,14 +358,21 @@ async def video_websocket(websocket: WebSocket):
             # frame's label if the phone stops sending metadata mid-stream.
             frame_meta = pending_meta
             pending_meta = None
-            latest_meta = frame_meta
 
             latest_frame = frame
 
             # Submit frame for background processing (non-blocking)
             # Only keep the latest frame - drop old ones
+            #
+            # `latest_meta` MUST be published in the same critical section as
+            # `pending_frame`: the inference worker reads the two together
+            # under this lock. When it was assigned before the lock, a worker
+            # acquiring the lock in between took the PREVIOUS, still-pending
+            # frame's pixels paired with THIS frame's metadata, so the depth
+            # map was labelled with the wrong seq/ts_ns (off by one).
             with processing_lock:
                 pending_frame = frame.copy()
+                latest_meta = frame_meta
 
             # Save every 10th RGB frame
             if frame_count % 10 == 0:

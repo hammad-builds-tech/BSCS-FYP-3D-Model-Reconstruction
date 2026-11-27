@@ -116,7 +116,7 @@ in this project yet.
 | Text message, valid JSON but **not an object** | Logged and ignored; connection kept |
 | Text message, **not JSON** | Logged and ignored; connection kept |
 | A second text message before any JPEG | **Replaces** the first |
-| Binary message that decodes as a JPEG | Accepted; pending metadata bound to it and cleared; ack sent |
+| Binary message that decodes as a JPEG | Accepted; pending metadata bound to it and cleared; the frame and its metadata are handed to the inference worker in one locked step; ack sent |
 | Binary message that does **not** decode | `{"status":"error","message":"Invalid JPEG frame"}`; the pending metadata is **discarded**, so it cannot label a later frame |
 | Connection closes with metadata still pending | The metadata is discarded with the connection; it is never carried into another connection |
 
@@ -163,6 +163,25 @@ committed. Each fix was verified with the same test that reproduced it.
    it. This one was found by code review and was never reproduced (0
    mismatches in 739 polls before the fix, 0 in 616 after), so the fix is
    verified structurally rather than by a failing-then-passing test.
+
+A fourth defect of the same kind was found when reviewing the M2 commit
+(`d2376a9`) and fixed in the commit after it:
+
+4. **The frame and its metadata were handed to the worker in two steps.**
+   The socket handler assigned `latest_meta` *before* taking
+   `processing_lock`, then set `pending_frame` inside it. The worker reads
+   both together under that lock, so a worker acquiring it in between took
+   the **previous, still-pending frame's pixels with this frame's metadata**,
+   and the resulting depth was labelled one frame too late. Fixed: both are
+   now assigned in the same critical section. The window is microseconds,
+   so no live run caught it. `scripts/check_frame_metadata.py` makes the
+   interleaving deterministic (it holds the worker so frames stay pending
+   and snapshots what a worker would read at every lock acquisition): on
+   `d2376a9` it reports 8 off-by-one pairings (pixels of frame *k* with the
+   metadata of frame *k*+1), and 0 of 17 after the fix.
+
+`/health` now also reads `latest_seq`, `depth_seq` and `depth_raw_available`
+inside the same lock, so the two seq numbers describe one instant.
 
 ## `GET /latest-frame`
 
@@ -281,4 +300,11 @@ discovery (Phase 1 limitation 13.3).
 ```bash
 curl -s http://127.0.0.1:8000/health | python3 -m json.tool
 venv/bin/python scripts/test_backend_pipeline.py   # needs frames in video_frames/
+venv/bin/python scripts/check_frame_metadata.py    # M2 association checks; in-process, no server needed
 ```
+
+`check_frame_metadata.py` is a standalone script, **not** a pytest suite
+(pytest is not installed in the backend venv). It imports
+`backend/api/main.py` in-process, so it loads MiDaS, and exits non-zero on
+any failure. Pass `--main <path>` to run it against a different copy of
+`main.py`.

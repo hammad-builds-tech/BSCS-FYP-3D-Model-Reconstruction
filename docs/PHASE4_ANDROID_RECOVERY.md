@@ -1305,8 +1305,11 @@ Other test assets in the repository, and why they are not in that total:
 | `scripts/test_backend_pipeline.py` | legacy smoke client; needs a `video_frames/` directory that is absent, so it cannot run as-is |
 | ROS 2 colcon tests | 17 files; untouched by M2; not re-run |
 
-`./gradlew assembleDebug`: BUILD SUCCESSFUL, 0 warnings. The rebuilt APK is
-bit-identical (`17425475...`) to the one physically tested.
+`./gradlew assembleDebug`: BUILD SUCCESSFUL, 0 warnings. ~~The rebuilt APK is
+bit-identical (`17425475...`) to the one physically tested.~~ **Corrected in
+section 49:** that build reported `assembleDebug UP-TO-DATE`, so it re-hashed
+the already-installed file rather than rebuilding it; it did not demonstrate
+a reproducible build.
 
 ### Integration regression (ad-hoc, not a test suite)
 
@@ -1342,6 +1345,8 @@ not a globally unique frame ID; `(seq, ts_ns)` is.
 
 ## 48. Remaining limitations
 
+*Superseded by section 50, which keeps this list and adds to it.*
+
 1. Depth is **relative, not metric**. No calibration against known distances.
 2. Crop not modelled; `fx` likely 0.39% low (44.4).
 3. ROS 2 still consumes the 8-bit preview; nothing downstream uses the
@@ -1350,3 +1355,143 @@ not a globally unique frame ID; `(seq, ts_ns)` is.
 5. No camera pose -- frames still cannot be fused into one coordinate system.
 6. Capture timebase not transmitted; no backend inference timestamp.
 7. `seq` restarts when the activity is recreated (section 47).
+
+## 49. Commit review: a fourth association defect, fixed separately
+
+Reviewing the M2 commit `d2376a9` before pushing found one more defect of
+the same kind as section 47. `d2376a9` is kept as it is; the fix is a
+separate commit on top of it.
+
+### The race
+
+In `video_websocket`, the accepted frame was published in two steps:
+
+```python
+latest_meta = frame_meta          # outside the lock
+latest_frame = frame
+with processing_lock:
+    pending_frame = frame.copy()
+```
+
+The inference worker reads `pending_frame` and `latest_meta` **together**
+under `processing_lock`. If frame *k-1* was still pending when frame *k*
+arrived, and the worker took the lock between those two statements, it
+received frame *k-1*'s pixels with frame *k*'s metadata. The depth map was
+then served with the wrong `X-Frame-Seq` and `X-Frame-Timestamp-Ns`, one
+frame late. That is exactly the error M2 exists to make detectable.
+
+### The fix
+
+`latest_meta = frame_meta` moved inside the existing `with processing_lock:`
+block, next to `pending_frame = frame.copy()`. No new lock, no nested
+acquisition, and latest-frame-wins is unchanged: `pending_frame` is still
+overwritten, never queued. `pending_meta` stays a local of each connection,
+and the invalid-JPEG path still discards it.
+
+`/health` previously read `latest_meta`, `depth_meta` and `latest_depth_npy`
+outside the lock it already takes. It now reads them inside, so
+`latest_seq` and `depth_seq` describe one instant.
+
+### Why the earlier tests passed
+
+The window is a few Python statements wide. Neither the 26-check regression
+nor the 87-second Wi-Fi run on the Pixel 7 Pro could make the worker take the
+lock at precisely that point. Passing those tests showed the race was rare;
+it did not show the race was absent.
+
+### Focused checks: `scripts/check_frame_metadata.py`
+
+This is a standalone script, **not** a pytest suite. pytest and httpx are not
+installed in the backend venv, and no dependency was added. It imports
+`backend/api/main.py` in-process, loading MiDaS as the server does, and
+drives the real `video_websocket` coroutine with a scripted fake WebSocket.
+Runtime output is redirected to a temporary directory.
+
+To make the race deterministic, it holds the worker inside `predict()` so
+frames stay pending. It also wraps `processing_lock` in a probe that, at
+every acquisition by the socket handler, records what a worker taking the
+lock at that instant would read.
+
+| Check | On `d2376a9` | After the fix |
+|---|---|---|
+| 1. pending pixels and metadata belong to the same frame | **FAIL**: 8 mismatches, pixels of frame *k* with the metadata of *k*+1 (and frame 5 with the legacy frame's `None`) | PASS: 0 of 17 |
+| 2. invalid JPEG does not label the next frame | PASS | PASS |
+| 3. new connection inherits no pending metadata | PASS | PASS |
+| 4. legacy binary-only client (acks, `seq` null, counter) | PASS | PASS |
+| 5. `.npy` is float32 with the source frame's shape; `X-Frame-Seq` and `X-Frame-Timestamp-Ns` name that frame; 8-bit preview still served | PASS | PASS |
+| **Total** | **19/20, exit 1** | **20/20, exit 0** |
+
+Checks 2 and 3 already passed on `d2376a9`, because those defects were fixed
+in that commit (section 47). Here they are regression guards, not
+before-and-after evidence.
+
+```
+venv/bin/python scripts/check_frame_metadata.py                     # 20/20
+venv/bin/python scripts/check_frame_metadata.py --main <d2376a9 copy> # 19/20
+```
+
+### Other verification after the fix
+
+| Suite | Command | Result |
+|---|---|---|
+| Integration regression, 26 checks (ad-hoc script kept outside the repo, against a dedicated `uvicorn` on 127.0.0.1:8000) | `venv/bin/python regress.py` | **26/26** |
+| Android JVM tests | `cd android && ./gradlew testDebugUnitTest --rerun-tasks` | **44/44**: CameraIntrinsics 17, OrientationStabiliser 20, YuvConverter 6, Example 1 |
+| Debug build | `./gradlew assembleDebug --rerun-tasks` | BUILD SUCCESSFUL, 0 warnings |
+
+These are three separate suites; their counts are not added together.
+Android source is unchanged by this fix.
+
+**APK hash correction.** The APK physically tested over Wi-Fi was
+`17425475...`, installed and verified on the device. Two forced rebuilds
+from the unchanged committed source today both produced `f74467d2...`. No
+Android source file was edited after that install, so the difference comes
+from the build, not the code. The tested APK was not kept, so the byte-level
+cause was not identified. Do not cite APK hashes from different builds as
+evidence that they are the same build.
+
+### Not affected by the fix
+
+Android code, the transmitted intrinsics (the Pixel 7 Pro's genuine
+`LENS_INTRINSIC_CALIBRATION` values in section 44), the `seq` and `ts_ns`
+semantics, the float32 payload, `/latest-depth-image`, the depth algorithm,
+ROS 2, Nav2 and Phases 1-3. No physical retest was run for this change,
+because it touches only backend thread ordering, which the in-process check
+exercises deterministically.
+
+### Protocol wording
+
+The protocol is **not versioned**: there is no version field in the
+metadata and no `/ws/video/v2`. `/ws/video` accepts an optional JSON text
+message before each binary JPEG, and binary-only clients are unaffected. The
+committed docs already said so (section 43, `docs/API.md`); only a chat
+report had called it versioned.
+
+## 50. Remaining limitations (current list; supersedes section 48)
+
+1. **Depth is MiDaS relative inverse depth, not metric.** Larger means
+   nearer; the scale is unknown and can change between frames. Nothing
+   converts it to metres.
+2. **Crop correction is incomplete.** The scaling from the sensor array to
+   the 640x480 analysis image does not model the crop CameraX applies when
+   the aspect ratios differ, so `fx` is likely about 0.39% low (section 44).
+3. **Distortion is transmitted but not applied.** Nothing in the project
+   undistorts frames or depth. The order is Camera2's `[k1, k2, k3, p1, p2]`,
+   not OpenCV's.
+4. **Distortion is not transformed for rotated images.** The intrinsics are
+   rotated with the JPEG, but the tangential terms `p1` and `p2` are sent in
+   sensor orientation. For a 90° or 270° frame they would need swapping and
+   sign changes before use.
+5. **The capture clock source must stay explicit.** `ts_ns` is the device's
+   sensor timestamp. `SENSOR_INFO_TIMESTAMP_SOURCE` is not read or sent, so
+   whether that is `REALTIME` or `UNKNOWN` is not recorded. It is not
+   wall-clock time and cannot be compared with the laptop's clock. The
+   backend records no inference timestamp.
+6. **`seq` restarts at 1 when the Android activity is recreated.** The
+   manifest declares no `configChanges`. Only `(seq, ts_ns)` together
+   identify a frame.
+7. **ROS 2 still consumes the 8-bit preview.** Nothing downstream uses the
+   float depth or the intrinsics yet.
+8. No camera pose is transmitted, so frames cannot yet be fused into one
+   coordinate system.
+9. The 135° and 225° hysteresis boundaries are tested on the JVM only, not
+   physically.
